@@ -206,6 +206,9 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Local deepwork session state
+.slim/deepwork/
+
 # PyPI configuration file
 .pypirc
 
