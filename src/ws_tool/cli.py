@@ -11,6 +11,7 @@ from .workspace import (
     create_workspace,
     enter_context,
     finalize_restore,
+    remove_workspace,
     render_status_human,
     restore_context,
     status_workspace,
@@ -45,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     context_actions.add_argument("--restore", action="store_true")
     context_actions.add_argument("--finalize-restore", action="store_true")
 
-    remove = commands.add_parser("remove", help="remove a workspace (future phase)")
+    remove = commands.add_parser("remove", help="remove a workspace")
     remove.add_argument("workspace")
     remove.add_argument("--config", type=str)
     return parser
@@ -93,6 +94,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 message = enter_context(args.repo, args.ref)
             print(message or f"Context operation completed for {args.repo}")
+            return 0
+        if args.command == "remove":
+            remove_workspace(args.workspace, config_path=args.config)
+            print(f"Removed workspace {args.workspace}")
             return 0
         print(f"ws {args.command} is not implemented in Phase 2A", file=sys.stderr)
         return 2
