@@ -4,12 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from ws_tool.errors import GitCommandError, GitWorktreeError
+import ws_tool.git as git_module
+from ws_tool.errors import ConfigError, GitCommandError, GitWorktreeError
 from ws_tool.git import (
+    GitResult,
     create_private_ref,
     delete_private_ref,
     is_git_repository,
     list_worktrees,
+    remote_symbolic_heads,
     run_git,
     validate_worktree_registration,
     worktree_admin_path,
@@ -42,6 +45,48 @@ def test_git_boundary_accepts_path_arguments(tmp_path: Path) -> None:
     run_git(["commit", "-m", "initial"], cwd=tmp_path)
 
     assert run_git(["rev-parse", "HEAD"], cwd=tmp_path).stdout.strip()
+
+
+def test_remote_symbolic_heads_resolve_target_commits(git_history_with_remote) -> None:
+    repo, _remote = git_history_with_remote
+    origin_main_oid = repo.run("rev-parse", "refs/remotes/origin/main").stdout.strip()
+
+    assert remote_symbolic_heads(repo.path) == (
+        ("refs/remotes/origin/HEAD", "refs/remotes/origin/main", origin_main_oid),
+    )
+
+
+def test_remote_symbolic_heads_reject_malformed_enumeration_output(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def malformed_output(args, *, cwd=None, check=True):
+        return GitResult(tuple(str(arg) for arg in args), cwd, 0, "malformed row\n", "")
+
+    monkeypatch.setattr(git_module, "run_git", malformed_output)
+
+    with pytest.raises(ConfigError, match="malformed remote symbolic HEAD output"):
+        remote_symbolic_heads(tmp_path)
+
+
+def test_remote_symbolic_heads_reject_malformed_resolved_oid(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def malformed_oid(args, *, cwd=None, check=True):
+        command = tuple(str(arg) for arg in args)
+        if command[:2] == ("for-each-ref", "--format=%(refname)%09%(symref)"):
+            return GitResult(
+                command,
+                cwd,
+                0,
+                "refs/remotes/origin/HEAD\trefs/remotes/origin/main\n",
+                "",
+            )
+        return GitResult(command, cwd, 0, "not-a-commit-id\n", "")
+
+    monkeypatch.setattr(git_module, "run_git", malformed_oid)
+
+    with pytest.raises(ConfigError, match="malformed commit ID"):
+        remote_symbolic_heads(tmp_path)
 
 
 def test_git_boundary_ignores_inherited_repository_routing_environment(

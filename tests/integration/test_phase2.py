@@ -262,6 +262,7 @@ def test_explicit_source_allows_ambiguous_remote_defaults_in_bare_source(
 ) -> None:
     seed = git_repo("ambiguous-seed")
     seed.branch("develop")
+    seed.commit("main divergence", content="main divergence\n")
     bare = bare_git_repo("ambiguous.git")
     seed.run("remote", "add", "origin", str(bare))
     seed.run("push", "origin", "main")
@@ -301,6 +302,93 @@ def test_explicit_source_allows_ambiguous_remote_defaults_in_bare_source(
         )
     )
     assert lock.repos["app"].default_selector is None
+
+
+def test_create_rejects_same_named_remote_heads_at_different_commits(
+    tmp_path: Path, git_repo, bare_git_repo
+) -> None:
+    source = git_repo("disagreeing-remotes")
+    origin = bare_git_repo("origin.git")
+    upstream = bare_git_repo("upstream.git")
+    source.add_remote(origin, "origin")
+    source.commit("second", content="second\n")
+    source.add_remote(upstream, "upstream")
+    source.run(
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    )
+    source.run(
+        "symbolic-ref",
+        "refs/remotes/upstream/HEAD",
+        "refs/remotes/upstream/main",
+    )
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+
+    result = run_ws(config_dir, "create", "disagreeing", "--config", str(config))
+
+    assert result.returncode != 0
+    assert "remote symbolic HEADs disagree" in result.stderr
+
+
+def test_create_accepts_differently_named_remote_heads_at_same_commit(
+    tmp_path: Path, git_repo, bare_git_repo
+) -> None:
+    source = git_repo("agreeing-remotes")
+    origin = bare_git_repo("origin.git")
+    upstream = bare_git_repo("upstream.git")
+    source.add_remote(origin, "origin")
+    source.add_remote(upstream, "upstream")
+    origin_main = source.run("rev-parse", "refs/remotes/origin/main").stdout.strip()
+    source.run("update-ref", "refs/remotes/upstream/develop", origin_main)
+    source.run(
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    )
+    source.run(
+        "symbolic-ref",
+        "refs/remotes/upstream/HEAD",
+        "refs/remotes/upstream/develop",
+    )
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+
+    result = run_ws(config_dir, "create", "agreeing", "--config", str(config))
+
+    assert result.returncode == 0, result.stderr
+    lock = deserialize_workspace_lock(
+        (tmp_path / "workspaces" / "agreeing" / "workspace.lock.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert lock.repos["app"].default_selector == "refs/remotes/origin/main"
+
+
+def test_create_rejects_unresolvable_remote_symbolic_head(
+    tmp_path: Path, git_repo, bare_git_repo
+) -> None:
+    source = git_repo("invalid-remote-head")
+    remote = bare_git_repo("origin.git")
+    source.add_remote(remote)
+    tree_oid = source.run("rev-parse", "HEAD^{tree}").stdout.strip()
+    source.run("update-ref", "refs/remotes/origin/not-a-commit", tree_oid)
+    source.run(
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/not-a-commit",
+    )
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+
+    result = run_ws(config_dir, "create", "invalid", "--config", str(config))
+
+    assert result.returncode != 0
+    assert "does not resolve to a commit" in result.stderr
 
 
 def test_create_rejects_existing_target_and_lifecycle_lock_without_cleanup(
@@ -642,7 +730,7 @@ def test_status_reports_durable_context_mode_and_phase(tmp_path: Path, git_repo)
     commit = source.run("rev-parse", "HEAD").stdout.strip()
     state = WorkspaceState(
         workspace_name="context-status",
-        phase="entering",
+        phase="idle",
         repos={
             "app": RepoState(
                 name="app",

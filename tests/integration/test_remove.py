@@ -4,13 +4,21 @@ import json
 import os
 import subprocess
 import sys
+import tomllib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 import ws_tool.workspace as workspace_module
 from ws_tool.errors import GitCommandError, WsError
-from ws_tool.serialization import deserialize_workspace_state
+from ws_tool.models import RemovalSeal
+from ws_tool.serialization import (
+    deserialize_removal_seal,
+    deserialize_workspace_state,
+    dump_toml,
+    write_removal_seal,
+)
 
 
 def run_ws(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -56,6 +64,262 @@ def create_workspace(tmp_path: Path, source: Path, name: str) -> tuple[Path, Pat
     return tmp_path / "workspaces" / name, config
 
 
+@pytest.fixture
+def sealed_tombstone(tmp_path: Path, git_repo, monkeypatch) -> tuple[Path, Path, RemovalSeal]:
+    source = git_repo("sealed-tombstone")
+    workspace, config = create_workspace(tmp_path, source.path, "sample")
+
+    # Stop immediately after the durable rename so this fixture supplies a
+    # complete tombstone without making the test depend on private file text.
+    monkeypatch.setattr(workspace_module, "_resume_sealed_tombstone_cleanup", lambda *_args: None)
+    workspace_module.remove_workspace("sample", config_path=config)
+    tombstone = workspace.parent / ".sample.removing"
+    seal = deserialize_removal_seal((tombstone / "removal-seal.toml").read_text(encoding="utf-8"))
+    (tombstone / ".ws" / "operation.lock").rmdir()
+    return tombstone, config.parent, seal
+
+
+def test_retry_removes_seal_only_tombstone(
+    sealed_tombstone: tuple[Path, Path, RemovalSeal]
+) -> None:
+    tombstone, config_dir, seal = sealed_tombstone
+    (tombstone / "workspace.lock.toml").unlink()
+    (tombstone / ".ws" / "state.toml").unlink()
+    if (tombstone / ".ws" / "operation.lock").exists():
+        (tombstone / ".ws" / "operation.lock").rmdir()
+    (tombstone / ".ws").rmdir()
+    (tombstone / "repos").rmdir()
+    write_removal_seal(tombstone / "removal-seal.toml", seal)
+
+    run = run_ws(config_dir, "remove", "sample", "--config", str(config_dir / "ws.toml"))
+
+    assert run.returncode == 0, run.stderr
+    assert not tombstone.exists()
+
+
+def test_retry_refuses_unknown_sealed_tombstone_entry(
+    sealed_tombstone: tuple[Path, Path, RemovalSeal]
+) -> None:
+    tombstone, config_dir, _seal = sealed_tombstone
+    (tombstone / "unexpected").write_text("unsafe", encoding="utf-8")
+
+    result = run_ws(config_dir, "remove", "sample", "--config", str(config_dir / "ws.toml"))
+
+    assert result.returncode != 0
+    assert "unexpected tombstone entry" in result.stderr
+    assert tombstone.exists()
+
+
+def test_retry_refuses_symlinked_sealed_tombstone_directory(
+    sealed_tombstone: tuple[Path, Path, RemovalSeal], tmp_path: Path
+) -> None:
+    tombstone, config_dir, _seal = sealed_tombstone
+    (tombstone / "repos").rmdir()
+    (tombstone / "repos").symlink_to(tmp_path)
+
+    result = run_ws(config_dir, "remove", "sample", "--config", str(config_dir / "ws.toml"))
+
+    assert result.returncode != 0
+    assert "unexpected tombstone entry" in result.stderr
+    assert (tombstone / "repos").is_symlink()
+
+
+def test_retry_upgrades_complete_legacy_tombstone(
+    sealed_tombstone: tuple[Path, Path, RemovalSeal]
+) -> None:
+    tombstone, config_dir, _seal = sealed_tombstone
+    seal_path = tombstone / "removal-seal.toml"
+    seal_path.unlink()
+    state_path = tombstone / ".ws" / "state.toml"
+    legacy = tomllib.loads(state_path.read_text(encoding="utf-8"))
+    legacy["schema_version"] = 1
+    del legacy["state"]["removal"]["seal"]
+    state_path.write_text(dump_toml(legacy), encoding="utf-8")
+
+    result = run_ws(config_dir, "remove", "sample", "--config", str(config_dir / "ws.toml"))
+
+    assert result.returncode == 0, result.stderr
+    assert not tombstone.exists()
+
+
+def test_retry_removes_exact_empty_terminal_tombstone(
+    sealed_tombstone: tuple[Path, Path, RemovalSeal]
+) -> None:
+    tombstone, config_dir, _seal = sealed_tombstone
+    (tombstone / "workspace.lock.toml").unlink()
+    (tombstone / ".ws" / "state.toml").unlink()
+    if (tombstone / ".ws" / "operation.lock").exists():
+        (tombstone / ".ws" / "operation.lock").rmdir()
+    (tombstone / ".ws").rmdir()
+    (tombstone / "repos").rmdir()
+    (tombstone / "removal-seal.toml").unlink()
+
+    result = run_ws(config_dir, "remove", "sample", "--config", str(config_dir / "ws.toml"))
+
+    assert result.returncode == 0, result.stderr
+    assert not tombstone.exists()
+
+
+def test_retry_refuses_embedded_standalone_seal_mismatch(
+    sealed_tombstone: tuple[Path, Path, RemovalSeal]
+) -> None:
+    tombstone, config_dir, seal = sealed_tombstone
+    repo = seal.repos["app"]
+    mismatched = replace(seal, repos={"app": replace(repo, branch="refs/heads/other")})
+    write_removal_seal(tombstone / "removal-seal.toml", mismatched)
+
+    result = run_ws(config_dir, "remove", "sample", "--config", str(config_dir / "ws.toml"))
+
+    assert result.returncode != 0
+    assert "seals do not match" in result.stderr
+    assert tombstone.exists()
+
+
+def test_retry_refuses_seal_terminal_state_identity_mismatch(
+    sealed_tombstone: tuple[Path, Path, RemovalSeal]
+) -> None:
+    tombstone, config_dir, _seal = sealed_tombstone
+    state_path = tombstone / ".ws" / "state.toml"
+    state_data = tomllib.loads(state_path.read_text(encoding="utf-8"))
+    state_data["state"]["removal"]["seal"]["repos"]["app"]["dirty"] = True
+    state_path.write_text(dump_toml(state_data), encoding="utf-8")
+
+    standalone_path = tombstone / "removal-seal.toml"
+    standalone_data = tomllib.loads(standalone_path.read_text(encoding="utf-8"))
+    standalone_data["seal"]["repos"]["app"]["dirty"] = True
+    standalone_path.write_text(dump_toml(standalone_data), encoding="utf-8")
+
+    result = run_ws(config_dir, "remove", "sample", "--config", str(config_dir / "ws.toml"))
+
+    assert result.returncode != 0
+    assert "terminal identity does not match state" in result.stderr
+    assert tombstone.exists()
+
+
+def test_retry_refuses_seal_lock_identity_mismatch(
+    sealed_tombstone: tuple[Path, Path, RemovalSeal]
+) -> None:
+    tombstone, config_dir, _seal = sealed_tombstone
+    lock_path = tombstone / "workspace.lock.toml"
+    lock_data = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+    lock_data["repos"]["app"]["base_ref"] = "refs/heads/other"
+    lock_path.write_text(dump_toml(lock_data), encoding="utf-8")
+
+    result = run_ws(config_dir, "remove", "sample", "--config", str(config_dir / "ws.toml"))
+
+    assert result.returncode != 0
+    assert "terminal identity does not match lock" in result.stderr
+    assert tombstone.exists()
+
+
+def test_retry_refuses_non_monotonic_sealed_tombstone(
+    sealed_tombstone: tuple[Path, Path, RemovalSeal]
+) -> None:
+    tombstone, config_dir, _seal = sealed_tombstone
+    (tombstone / ".ws" / "state.toml").unlink()
+
+    result = run_ws(config_dir, "remove", "sample", "--config", str(config_dir / "ws.toml"))
+
+    assert result.returncode != 0
+    assert "non-monotonic" in result.stderr
+    assert tombstone.exists()
+
+
+def test_empty_terminal_retry_retains_lifecycle_lock_on_final_fsync_failure(
+    tmp_path: Path, git_repo, monkeypatch
+) -> None:
+    source = git_repo("empty-terminal-fsync")
+    config_dir = tmp_path / "config-empty-terminal-fsync"
+    config_dir.mkdir()
+    config = write_config(config_dir / "ws.toml", tmp_path / "workspaces", {"app": source.path})
+    tombstone = tmp_path / "workspaces" / ".sample.removing"
+    tombstone.mkdir(parents=True)
+    workspace_root = tombstone.parent
+    original_fsync = workspace_module.fsync_directory
+
+    def fail_final_parent_fsync(directory: Path) -> None:
+        if directory == workspace_root and not tombstone.exists():
+            raise OSError("injected final parent fsync failure")
+        original_fsync(directory)
+
+    monkeypatch.setattr(workspace_module, "fsync_directory", fail_final_parent_fsync)
+    monkeypatch.chdir(config_dir)
+    with pytest.raises(WsError, match="fsync"):
+        workspace_module.remove_workspace("sample", config_path=config)
+
+    assert not tombstone.exists()
+    lifecycle_lock = workspace_root / ".sample.lifecycle.lock"
+    assert lifecycle_lock.is_dir()
+    lifecycle_lock.rmdir()
+
+
+def test_rename_fsync_failure_retains_lifecycle_and_tombstone_operation_locks(
+    tmp_path: Path, git_repo, monkeypatch
+) -> None:
+    source = git_repo("rename-fsync-failure")
+    workspace, config = create_workspace(tmp_path, source.path, "rename-fsync")
+    tombstone = workspace.parent / ".rename-fsync.removing"
+    original_fsync = workspace_module.fsync_directory
+
+    def fail_tombstone_rename_fsync(directory: Path) -> None:
+        if directory == workspace.parent and tombstone.exists():
+            raise OSError("injected tombstone rename fsync failure")
+        original_fsync(directory)
+
+    monkeypatch.setattr(workspace_module, "fsync_directory", fail_tombstone_rename_fsync)
+    monkeypatch.chdir(workspace)
+    with pytest.raises(WsError, match="injected tombstone rename fsync failure"):
+        workspace_module.remove_workspace("rename-fsync", config_path=config)
+
+    assert not workspace.exists()
+    assert tombstone.is_dir()
+    assert (workspace.parent / ".rename-fsync.lifecycle.lock").is_dir()
+    assert (tombstone / ".ws" / "operation.lock").is_dir()
+
+    (tombstone / ".ws" / "operation.lock").rmdir()
+    (workspace.parent / ".rename-fsync.lifecycle.lock").rmdir()
+    retried = run_ws(
+        tmp_path / "config-rename-fsync",
+        "remove",
+        "rename-fsync",
+        "--config",
+        str(config),
+    )
+
+    assert retried.returncode == 0, retried.stderr
+    assert not tombstone.exists()
+
+
+def test_retry_refuses_stale_tombstone_operation_lock_as_ws_error(
+    sealed_tombstone: tuple[Path, Path, RemovalSeal]
+) -> None:
+    tombstone, config_dir, _seal = sealed_tombstone
+    operation_lock = tombstone / ".ws" / "operation.lock"
+    operation_lock.mkdir()
+
+    result = run_ws(config_dir, "remove", "sample", "--config", str(config_dir / "ws.toml"))
+
+    assert result.returncode != 0
+    assert "workspace operation lock already exists" in result.stderr
+    assert operation_lock.is_dir()
+    assert tombstone.exists()
+
+
+def test_retry_refuses_surviving_exact_git_admin_identity(
+    sealed_tombstone: tuple[Path, Path, RemovalSeal]
+) -> None:
+    tombstone, config_dir, seal = sealed_tombstone
+    admin = seal.repos["app"].git_admin_path
+    admin.parent.mkdir(parents=True)
+    admin.mkdir()
+
+    result = run_ws(config_dir, "remove", "sample", "--config", str(config_dir / "ws.toml"))
+
+    assert result.returncode != 0
+    assert "administrative identity remains" in result.stderr
+    assert tombstone.exists()
+
+
 def test_remove_happy_path_preserves_source_branch_and_unrelated_worktree(tmp_path: Path, git_repo):
     source = git_repo("remove-happy")
     source.branch("keep/branch")
@@ -73,6 +337,35 @@ def test_remove_happy_path_preserves_source_branch_and_unrelated_worktree(tmp_pa
     assert unrelated.is_dir()
     assert str(worktree) not in git_output(source.path, "worktree", "list")
     assert str(unrelated) in git_output(source.path, "worktree", "list")
+
+
+def test_remove_persists_embedded_and_standalone_seal_before_rename(
+    tmp_path: Path, git_repo, monkeypatch
+) -> None:
+    source = git_repo("remove-seal")
+    workspace, config = create_workspace(tmp_path, source.path, "seal")
+    observed: list[tuple[Path, object, object]] = []
+    original_write = workspace_module.write_removal_seal
+
+    def observe_seal(path, seal):
+        original_write(path, seal)
+        persisted = deserialize_workspace_state(
+            (workspace / ".ws" / "state.toml").read_text(encoding="utf-8")
+        )
+        assert workspace.is_dir()
+        assert path == workspace / "removal-seal.toml"
+        assert persisted.removal is not None
+        assert persisted.removal.seal == seal
+        observed.append((path, seal, persisted.removal.seal))
+
+    monkeypatch.setattr(workspace_module, "write_removal_seal", observe_seal)
+
+    workspace_module.remove_workspace("seal", config_path=config)
+
+    assert len(observed) == 1
+    assert observed[0][1] == observed[0][2]
+    assert not workspace.exists()
+    assert not (workspace.parent / ".seal.removing").exists()
 
 
 def test_remove_refuses_dirty_worktree_without_mutation(tmp_path: Path, git_repo):
@@ -325,15 +618,13 @@ def test_remove_tombstone_cleanup_interrupt_retains_parseable_state_and_locks(
 ) -> None:
     source = git_repo("remove-tombstone-crash")
     workspace, config = create_workspace(tmp_path, source.path, "tombstone-crash")
-    original_rmtree = workspace_module.shutil.rmtree
     tombstone = workspace.parent / ".tombstone-crash.removing"
 
-    def interrupt_cleanup(path):
-        assert path == tombstone
-        original_rmtree(path)
+    def interrupt_cleanup(path, seal):
+        assert path.workspace == tombstone
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(workspace_module.shutil, "rmtree", interrupt_cleanup)
+    monkeypatch.setattr(workspace_module, "_resume_sealed_tombstone_cleanup", interrupt_cleanup)
     monkeypatch.chdir(workspace)
     with pytest.raises(KeyboardInterrupt):
         workspace_module.remove_workspace("tombstone-crash", config_path=config)
@@ -347,13 +638,11 @@ def test_remove_tombstone_cleanup_interrupt_retains_parseable_state_and_locks(
     assert lifecycle_lock.is_dir()
     assert operation_lock.is_dir()
     assert not workspace.exists()
-    status = run_ws(tombstone, "status", "--json")
-    assert status.returncode == 0, status.stderr
-    assert json.loads(status.stdout)["removal"]["phase"] == "removal_complete"
+    seal = (tombstone / "removal-seal.toml").read_text(encoding="utf-8")
+    assert "removal_complete" in seal
 
     operation_lock.rmdir()
     lifecycle_lock.rmdir()
-    monkeypatch.setattr(workspace_module.shutil, "rmtree", original_rmtree)
     retried = run_ws(
         tmp_path / "config-tombstone-crash",
         "remove",

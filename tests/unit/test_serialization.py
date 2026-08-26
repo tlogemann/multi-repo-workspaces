@@ -10,6 +10,8 @@ from ws_tool.models import (
     ContextSideEffect,
     ContextState,
     RemovalRepoState,
+    RemovalSeal,
+    RemovalSealRepo,
     RemovalState,
     RepoState,
     WorkspaceLock,
@@ -17,13 +19,16 @@ from ws_tool.models import (
     WorkspaceState,
 )
 from ws_tool.serialization import (
+    deserialize_removal_seal,
     deserialize_workspace_lock,
     deserialize_workspace_state,
     dump_toml,
+    serialize_removal_seal,
     serialize_workspace_lock,
     serialize_workspace_state,
     validate_lock_state_consistency,
     validate_removal_repo_identity,
+    write_removal_seal,
     write_toml,
     write_workspace_lock,
     write_workspace_state,
@@ -109,7 +114,7 @@ def test_workspace_lock_and_runtime_state_round_trip() -> None:
     )
     state = WorkspaceState(
         workspace_name="demo",
-        phase="active",
+        phase="idle",
         repos={
             "app": RepoState(
                 name="app",
@@ -250,7 +255,7 @@ def test_context_mode_requires_detached_repository_and_allows_detached_return_mo
     )
     state = WorkspaceState(
         workspace_name="demo",
-        phase="active",
+        phase="idle",
         repos={"app": RepoState(name="app", mode="context", detached=True, context=context)},
     )
 
@@ -533,7 +538,7 @@ def test_rejects_malformed_context_recovery_records(
 
 
 def test_rejects_removal_phase_without_removal_record() -> None:
-    with pytest.raises(SerializationError, match=r"requires \[state.removal\]"):
+    with pytest.raises(SerializationError, match="without removal.*idle"):
         deserialize_workspace_state(_state_text(phase="removing"))
 
 
@@ -550,7 +555,7 @@ def test_rejects_top_level_phase_mismatch_with_removal_record() -> None:
         ),
     )
 
-    with pytest.raises(SerializationError, match="requires a removal state phase"):
+    with pytest.raises(SerializationError, match="'removing'.*'idle'"):
         deserialize_workspace_state(text)
 
 
@@ -568,7 +573,7 @@ def test_lock_state_consistency_rejects_different_repository_identities() -> Non
     )
     state = WorkspaceState(
         workspace_name="demo",
-        phase="active",
+        phase="idle",
         repos={"lib": RepoState(name="lib", mode="claimed")},
     )
 
@@ -587,7 +592,7 @@ def test_rejects_duplicate_context_stash_tokens() -> None:
     )
     state = WorkspaceState(
         workspace_name="demo",
-        phase="active",
+        phase="idle",
         repos={
             "app": RepoState(name="app", mode="context", detached=True, context=context),
             "lib": RepoState(name="lib", mode="context", detached=True, context=context),
@@ -596,3 +601,237 @@ def test_rejects_duplicate_context_stash_tokens() -> None:
 
     with pytest.raises(SerializationError, match="stash tokens must be unique"):
         serialize_workspace_state(state)
+
+
+V1_ACTIVE_CONTEXT_TOML = (
+    'schema_version = 1\n\n[workspace]\nname = "demo"\n\n'
+    '[state]\nphase = "active"\n\n'
+    '[state.repos.app]\nname = "app"\nmode = "context"\n'
+    'head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
+    'detached = true\ndirty = false\n\n'
+    '[state.repos.app.context]\ntarget_ref = "default"\n'
+    'target_commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"\nphase = "active"\n'
+    'return_mode = "claimed"\nstash_token = "app-token"\n'
+    'return_saved_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n\n'
+    '[state.repos.api]\nname = "api"\nmode = "context"\n'
+    'head = "cccccccccccccccccccccccccccccccccccccccc"\n'
+    'detached = true\ndirty = false\n\n'
+    '[state.repos.api.context]\ntarget_ref = "release"\n'
+    'target_commit = "dddddddddddddddddddddddddddddddddddddddd"\nphase = "restoring"\n'
+    'return_mode = "detached"\nstash_token = "api-token"\n'
+    'return_saved_head = "cccccccccccccccccccccccccccccccccccccccc"\n'
+)
+
+V2_REMOVAL_WITH_CONTEXT_TOML = (
+    'schema_version = 2\n\n[workspace]\nname = "demo"\n\n'
+    '[state]\nphase = "removing"\n\n'
+    '[state.repos.app]\nname = "app"\nmode = "context"\n'
+    'head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
+    'detached = true\ndirty = false\n\n'
+    '[state.repos.app.context]\ntarget_ref = "default"\n'
+    'target_commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"\nphase = "active"\n'
+    'return_mode = "claimed"\nstash_token = "app-token"\n'
+    'return_saved_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n\n'
+    '[state.removal]\nphase = "removing"\n'
+    'workspace_path = "/workspaces/demo"\n'
+    'tombstone_path = "/workspaces/.demo.removing"\n\n'
+    '[state.removal.repos.app]\nname = "app"\n'
+    'worktree_path = "/workspaces/demo/app"\n'
+    'git_admin_path = "/sources/app/.git/worktrees/demo-app"\n'
+    'complete = false\n'
+)
+
+
+def test_deserialize_v1_context_phase_preserves_repo_context() -> None:
+    state = deserialize_workspace_state(V1_ACTIVE_CONTEXT_TOML)
+
+    assert state.schema_version == 2
+    assert state.phase == "idle"
+    assert state.repos["app"].context is not None
+    assert state.repos["app"].context.phase == "active"
+    assert state.repos["api"].context is not None
+    assert state.repos["api"].context.phase == "restoring"
+    assert tomllib.loads(serialize_workspace_state(state))["schema_version"] == 2
+
+
+def test_v2_rejects_removal_with_any_repository_context() -> None:
+    with pytest.raises(SerializationError, match="removal.*context"):
+        deserialize_workspace_state(V2_REMOVAL_WITH_CONTEXT_TOML)
+
+
+def _removal_seal() -> RemovalSeal:
+    return RemovalSeal(
+        workspace_name="sample",
+        workspace_path=Path("/tmp/sample"),
+        tombstone_path=Path("/tmp/.sample.removing"),
+        repos={
+            "app": RemovalSealRepo(
+                name="app",
+                source_path=Path("/tmp/source-app"),
+                worktree_path=Path("/tmp/sample/repos/app"),
+                git_admin_path=Path("/tmp/source-app/.git/worktrees/app"),
+                base_ref="origin/main",
+                base_commit="0" * 40,
+                default_selector="origin/main",
+                mode="detached",
+                head="0" * 40,
+                branch=None,
+                detached=True,
+                dirty=False,
+            )
+        },
+    )
+
+
+def test_removal_seal_round_trips_without_state_or_lock_digest() -> None:
+    seal = _removal_seal()
+
+    text = serialize_removal_seal(seal)
+    parsed = tomllib.loads(text)
+    repo = parsed["seal"]["repos"]["app"]
+
+    assert deserialize_removal_seal(text) == seal
+    assert "state" not in parsed["seal"]
+    assert "lock" not in parsed["seal"]
+    assert "digest" not in text
+    assert "branch" not in repo
+
+
+def test_removal_seal_writer_is_atomic_and_syncable(tmp_path: Path) -> None:
+    target = tmp_path / "removal-seal.toml"
+    synced: list[Path] = []
+
+    write_removal_seal(target, _removal_seal(), fsync_directory=synced.append)
+
+    assert deserialize_removal_seal(target.read_text(encoding="utf-8")) == _removal_seal()
+    assert synced == [tmp_path]
+    assert list(tmp_path.glob("removal-seal.toml.*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("schema_version = 2\n", "unsupported schema version"),
+        (
+            'schema_version = 1\n\n[seal]\nworkspace_name = "sample"\n'
+            'workspace_path = "/tmp/sample"\ntombstone_path = "/tmp/.sample.removing"\n'
+            'phase = "removal_complete"\nstate_digest = "bad"\n',
+            "unexpected fields",
+        ),
+        (
+            'schema_version = 1\n\n[seal]\nworkspace_name = "sample"\n'
+            'workspace_path = "/tmp/sample"\ntombstone_path = "/tmp/.sample.removing"\n'
+            'phase = "removing"\n\n[seal.repos.app]\nname = "app"\n'
+            'source_path = "/tmp/source-app"\nworktree_path = "/tmp/sample/repos/app"\n'
+            'git_admin_path = "/tmp/source-app/.git/worktrees/app"\n'
+            'base_ref = "origin/main"\nbase_commit = "' + "0" * 40 + '"\n'
+            'mode = "detached"\ndetached = true\ndirty = false\n',
+            "removal_complete",
+        ),
+    ],
+)
+def test_rejects_malformed_removal_seals(text: str, message: str) -> None:
+    with pytest.raises(SerializationError, match=message):
+        deserialize_removal_seal(text)
+
+
+def test_completed_state_embeds_the_same_removal_seal() -> None:
+    seal = _removal_seal()
+    state = WorkspaceState(
+        workspace_name="sample",
+        phase="removal_complete",
+        repos={"app": RepoState(name="app", mode="detached", head="0" * 40, detached=True)},
+        removal=RemovalState(
+            phase="removal_complete",
+            workspace_path=seal.workspace_path,
+            tombstone_path=seal.tombstone_path,
+            repos={
+                "app": RemovalRepoState(
+                    name="app",
+                    worktree_path=seal.repos["app"].worktree_path,
+                    git_admin_path=seal.repos["app"].git_admin_path,
+                    complete=True,
+                )
+            },
+            seal=seal,
+        ),
+    )
+
+    serialized = serialize_workspace_state(state)
+    embedded = deserialize_workspace_state(serialized).removal
+
+    assert embedded is not None
+    assert embedded.seal == deserialize_removal_seal(serialize_removal_seal(seal))
+
+
+def test_v1_completed_removal_without_seal_remains_readable() -> None:
+    text = _state_text(
+        phase="removal_complete",
+        removal=(
+            '\n[state.removal]\nphase = "removal_complete"\n'
+            'workspace_path = "/workspaces/demo"\n'
+            'tombstone_path = "/workspaces/.demo.removing"\n\n'
+            '[state.removal.repos.app]\nname = "app"\n'
+            'worktree_path = "/workspaces/demo/app"\n'
+            'git_admin_path = "/sources/app/.git/worktrees/demo-app"\ncomplete = true\n'
+        ),
+    )
+
+    state = deserialize_workspace_state(text)
+
+    assert state.schema_version == 2
+    assert state.removal is not None
+    assert state.removal.seal is None
+    with pytest.raises(SerializationError, match="requires a removal seal"):
+        serialize_workspace_state(state)
+
+
+def test_v2_completed_removal_without_seal_fails_closed_everywhere() -> None:
+    state = WorkspaceState(
+        workspace_name="demo",
+        phase="removal_complete",
+        repos={"app": RepoState(name="app", mode="detached", head="a" * 40, detached=True)},
+        removal=RemovalState(
+            phase="removal_complete",
+            workspace_path=Path("/workspaces/demo"),
+            tombstone_path=Path("/workspaces/.demo.removing"),
+            repos={
+                "app": RemovalRepoState(
+                    name="app",
+                    worktree_path=Path("/workspaces/demo/app"),
+                    git_admin_path=Path("/sources/app/.git/worktrees/demo-app"),
+                    complete=True,
+                )
+            },
+        ),
+    )
+    lock = WorkspaceLock(
+        workspace_name="demo",
+        repos={
+            "app": WorkspaceLockRepo(
+                name="app",
+                source_path=Path("/sources/app"),
+                base_ref="origin/main",
+                base_commit="a" * 40,
+            )
+        },
+    )
+
+    with pytest.raises(SerializationError, match="requires a removal seal"):
+        serialize_workspace_state(state)
+    with pytest.raises(SerializationError, match="requires a removal seal"):
+        validate_lock_state_consistency(lock, state)
+
+    v2_text = _state_text(
+        phase="removal_complete",
+        removal=(
+            '\n[state.removal]\nphase = "removal_complete"\n'
+            'workspace_path = "/workspaces/demo"\n'
+            'tombstone_path = "/workspaces/.demo.removing"\n\n'
+            '[state.removal.repos.app]\nname = "app"\n'
+            'worktree_path = "/workspaces/demo/app"\n'
+            'git_admin_path = "/sources/app/.git/worktrees/demo-app"\ncomplete = true\n'
+        ),
+    ).replace("schema_version = 1", "schema_version = 2", 1)
+    with pytest.raises(SerializationError, match="requires a removal seal"):
+        deserialize_workspace_state(v2_text)

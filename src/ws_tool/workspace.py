@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import shutil
+import re
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -12,16 +12,18 @@ from .git import (
     create_private_ref,
     delete_private_ref,
     list_worktrees,
+    remote_symbolic_heads,
     repository_kind,
     run_git,
     validate_worktree_registration,
 )
 from .models import (
-    CONTEXT_PHASES,
     REMOVAL_PHASES,
     ContextSideEffect,
     ContextState,
     RemovalRepoState,
+    RemovalSeal,
+    RemovalSealRepo,
     RemovalState,
     RepoState,
     WorkspaceLock,
@@ -29,14 +31,29 @@ from .models import (
     WorkspaceState,
 )
 from .serialization import (
+    deserialize_removal_seal,
     deserialize_workspace_lock,
     deserialize_workspace_state,
+    fsync_directory,
     validate_lock_state_consistency,
     validate_removal_repo_identity,
+    write_removal_seal,
     write_workspace_lock,
     write_workspace_state,
 )
 from .validation import validate_logical_name
+
+
+def _removal_test_boundary(_name: str) -> None:
+    """Test-only hook kept inert in production."""
+
+    return None
+
+
+def _creation_test_boundary(_name: str) -> None:
+    """Test-only hook kept inert in production."""
+
+    return None
 
 
 @dataclass(frozen=True)
@@ -48,6 +65,15 @@ class WorkspacePaths:
     tombstone: Path
     lifecycle_lock: Path
     operation_lock: Path
+    removal_seal: Path
+
+
+@dataclass(frozen=True)
+class _TombstoneClassification:
+    seal: RemovalSeal | None
+    lock: WorkspaceLock | None
+    state: WorkspaceState | None
+    terminal: bool = False
 
 
 @dataclass(frozen=True)
@@ -88,6 +114,7 @@ def create_workspace(
             raise WsError(
                 f"workspace lifecycle lock already exists: {paths.lifecycle_lock}"
             ) from exc
+        _creation_test_boundary("create.lifecycle_locked")
         if paths.workspace.exists():
             raise WsError(f"workspace already exists: {paths.workspace}")
         if paths.tombstone.exists() or paths.tombstone.is_symlink():
@@ -268,17 +295,13 @@ def claim_workspace(
             raise WsError(
                 f"cannot claim repository while workspace removal is durable: {paths.workspace}"
             )
-        if state.phase in CONTEXT_PHASES:
-            raise WsError(
-                f"cannot claim repository while workspace context phase is {state.phase!r}"
-            )
         locked = lock.repos.get(repository_name)
         if locked is None:
             raise WsError(
                 f"repository {repository_name!r} is not part of workspace {lock.workspace_name!r}"
             )
         saved = state.repos[repository_name]
-        if saved.context is not None or saved.mode == "context":
+        if saved.context is not None:
             raise WsError(f"repository {repository_name!r} has an active context; restore it first")
 
         worktree = paths.workspace / "repos" / repository_name
@@ -339,17 +362,49 @@ def remove_workspace(
             raise WsError(
                 f"workspace lifecycle lock already exists: {base_paths.lifecycle_lock}"
             ) from exc
+        _removal_test_boundary("remove.lifecycle_locked")
 
         location = _existing_removal_paths(base_paths)
-        try:
-            location.operation_lock.mkdir()
-            operation_acquired = True
-        except FileExistsError as exc:
-            raise WsError(
-                f"workspace operation lock already exists: {location.operation_lock}"
-            ) from exc
-
-        lock, state = _read_metadata(location)
+        if location.workspace == base_paths.tombstone:
+            classification = _classify_removal_tombstone(location)
+            if classification.terminal:
+                try:
+                    _resume_sealed_tombstone_cleanup(location, None)
+                except BaseException:
+                    # The tombstone has crossed the final deletion boundary;
+                    # keep the external lifecycle lock if its parent fsync
+                    # (or the rmdir itself) fails.
+                    retain_locks = True
+                    raise
+                return
+            if classification.seal is not None:
+                operation_acquired = _acquire_tombstone_operation_lock(location)
+                try:
+                    _resume_sealed_tombstone_cleanup(location, classification.seal)
+                except BaseException:
+                    # The lifecycle lock is the authority across the terminal
+                    # unlink window.  Never release it after a cleanup failure.
+                    retain_locks = True
+                    raise
+                return
+            assert classification.lock is not None
+            assert classification.state is not None
+            lock, state = classification.lock, classification.state
+            try:
+                operation_acquired = _acquire_tombstone_operation_lock(location)
+            except FileExistsError as exc:
+                raise WsError(
+                    f"workspace operation lock already exists: {location.operation_lock}"
+                ) from exc
+        else:
+            try:
+                location.operation_lock.mkdir()
+                operation_acquired = True
+            except FileExistsError as exc:
+                raise WsError(
+                    f"workspace operation lock already exists: {location.operation_lock}"
+                ) from exc
+            lock, state = _read_metadata(location)
         resuming_removal = state.removal is not None
         if lock.workspace_name != workspace_name:
             raise WsError(
@@ -375,7 +430,12 @@ def remove_workspace(
                 if removal.phase != "removal_complete":
                     raise WsError("removal tombstone has an incomplete removal phase")
                 _verify_removal_complete(lock, removal)
-                _delete_removal_tombstone(location)
+                _sealed_state, seal = _prepare_removal_seal(location, lock, state)
+                try:
+                    _resume_sealed_tombstone_cleanup(location, seal)
+                except BaseException:
+                    retain_locks = True
+                    raise
                 return
             if removal.phase not in REMOVAL_PHASES:
                 raise WsError(f"unknown persisted removal phase {removal.phase!r}")
@@ -386,6 +446,7 @@ def remove_workspace(
             removal = _preflight_removal(lock, state, location)
             state = replace(state, phase="removing", removal=removal)
             write_workspace_state(location.state, state)
+            _removal_test_boundary("removing_persisted")
 
         current_removal = state.removal
         assert current_removal is not None
@@ -421,9 +482,22 @@ def remove_workspace(
 
         current_removal = replace(current_removal, phase="removal_complete")
         state = replace(state, phase="removal_complete", removal=current_removal)
-        write_workspace_state(location.state, state)
-        _rename_to_removal_tombstone(location, base_paths.tombstone)
-        _delete_removal_tombstone(_tombstone_paths(base_paths))
+        state, seal = _prepare_removal_seal(location, lock, state)
+        try:
+            _rename_to_removal_tombstone(location, base_paths.tombstone)
+        except BaseException:
+            # Once rename succeeds, the operation lock has moved into the
+            # tombstone.  Keep both locks if its directory fsync fails so a
+            # retry cannot race with the partially durable terminal state.
+            if not location.workspace.exists() and base_paths.tombstone.exists():
+                retain_locks = True
+            raise
+        tombstone_paths = _tombstone_paths(base_paths)
+        try:
+            _resume_sealed_tombstone_cleanup(tombstone_paths, seal)
+        except BaseException:
+            retain_locks = True
+            raise
     except BaseException as exc:
         if isinstance(exc, KeyboardInterrupt) or removal_uncertain:
             retain_locks = True
@@ -496,6 +570,7 @@ def _tombstone_paths(base: WorkspacePaths) -> WorkspacePaths:
         lock=tombstone / "workspace.lock.toml",
         state=tombstone / ".ws" / "state.toml",
         operation_lock=tombstone / ".ws" / "operation.lock",
+        removal_seal=tombstone / "removal-seal.toml",
     )
 
 
@@ -504,6 +579,10 @@ def _preflight_removal(
     state: WorkspaceState,
     paths: WorkspacePaths,
 ) -> RemovalState:
+    if any(repo.context is not None for repo in state.repos.values()):
+        raise WsError(
+            "workspace removal preflight failed: repository has an active temporary context"
+        )
     issues: list[str] = []
     records: dict[str, RemovalRepoState] = {}
     for name, locked in lock.repos.items():
@@ -574,6 +653,35 @@ def _preflight_removal_retry(
             issues.append(f"{name}: {exc}")
     if issues:
         raise WsError("workspace removal retry preflight failed: " + "; ".join(issues))
+
+
+def _build_removal_seal(
+    lock: WorkspaceLock, state: WorkspaceState, removal: RemovalState
+) -> RemovalSeal:
+    repos: dict[str, RemovalSealRepo] = {}
+    for name, locked in lock.repos.items():
+        record = removal.repos[name]
+        repo = state.repos[name]
+        repos[name] = RemovalSealRepo(
+            name=name,
+            source_path=locked.source_path,
+            worktree_path=record.worktree_path,
+            git_admin_path=record.git_admin_path,
+            base_ref=locked.base_ref,
+            base_commit=locked.base_commit,
+            default_selector=locked.default_selector,
+            mode=repo.mode,
+            head=repo.head,
+            branch=repo.branch,
+            detached=repo.detached,
+            dirty=repo.dirty,
+        )
+    return RemovalSeal(
+        workspace_name=state.workspace_name,
+        workspace_path=removal.workspace_path,
+        tombstone_path=removal.tombstone_path,
+        repos=repos,
+    )
 
 
 def _check_removal_source(source: Path) -> None:
@@ -663,6 +771,7 @@ def _remove_expected_worktree(
     )
     run_git(["worktree", "remove", worktree], cwd=source)
     _verify_removed_record(lock, repository_name, record)
+    _removal_test_boundary("worktree_removed")
 
 
 def _rename_to_removal_tombstone(paths: WorkspacePaths, tombstone: Path) -> None:
@@ -674,65 +783,374 @@ def _rename_to_removal_tombstone(paths: WorkspacePaths, tombstone: Path) -> None
     if not (paths.workspace / ".ws").is_dir():
         raise WsError("workspace metadata directory is missing before removal rename")
     paths.workspace.rename(tombstone)
+    _fsync_directory_checked(paths.root)
+    _removal_test_boundary("tombstone_renamed")
 
 
-def _delete_removal_tombstone(paths: WorkspacePaths) -> None:
-    if not paths.workspace.is_dir():
-        raise WsError(f"removal tombstone is missing: {paths.workspace}")
-    repos = paths.workspace / "repos"
-    metadata = paths.workspace / ".ws"
-    if {entry.name for entry in paths.workspace.iterdir()} != {
-        ".ws",
-        "repos",
-        "workspace.lock.toml",
-    }:
-        raise WsError("removal tombstone contains unexpected top-level content")
-    if not repos.is_dir() or any(repos.iterdir()):
-        raise WsError("removal tombstone contains unexpected repository content")
-    if not metadata.is_dir():
-        raise WsError("removal tombstone metadata directory is missing")
-    if {entry.name for entry in metadata.iterdir()} != {"state.toml", "operation.lock"}:
-        raise WsError("removal tombstone contains unexpected metadata content")
-    if paths.lock.is_symlink() or not paths.lock.is_file():
-        raise WsError(f"removal tombstone contains unexpected metadata: {paths.lock}")
-    if paths.state.is_symlink() or not paths.state.is_file():
-        raise WsError(f"removal tombstone contains unexpected state metadata: {paths.state}")
-    if not paths.operation_lock.is_dir() or any(paths.operation_lock.iterdir()):
-        raise WsError(f"removal operation lock is not an empty directory: {paths.operation_lock}")
-    lock_text = paths.lock.read_text(encoding="utf-8")
-    state_text = paths.state.read_text(encoding="utf-8")
-    try:
-        # Keep the authoritative lock/state intact until the final recursive
-        # cleanup.  If cleanup is interrupted, reconstruct the exact
-        # deterministic tombstone before propagating the interruption.
-        shutil.rmtree(paths.workspace)
-    except BaseException as exc:
-        try:
-            _restore_interrupted_tombstone(paths, lock_text, state_text)
-        except BaseException as restore_error:
-            exc.add_note(f"could not reconstruct removal tombstone: {restore_error}")
-        raise
-
-
-def _restore_interrupted_tombstone(
+def _prepare_removal_seal(
     paths: WorkspacePaths,
-    lock_text: str,
-    state_text: str,
+    lock: WorkspaceLock,
+    state: WorkspaceState,
+) -> tuple[WorkspaceState, RemovalSeal]:
+    removal = _require_removal_complete(state.removal)
+    seal = _build_removal_seal(lock, state, removal)
+    sealed_state = replace(state, removal=replace(removal, seal=seal))
+    write_workspace_state(paths.state, sealed_state)
+    _removal_test_boundary("removal_complete_persisted")
+    write_removal_seal(paths.removal_seal, seal)
+    _removal_test_boundary("standalone_seal_persisted")
+    return sealed_state, seal
+
+
+def _require_removal_complete(removal: RemovalState | None) -> RemovalState:
+    if removal is None or removal.phase != "removal_complete":
+        raise WsError("removal tombstone does not contain completed removal progress")
+    if any(not record.complete for record in removal.repos.values()):
+        raise WsError("removal tombstone has incomplete repository progress")
+    return removal
+
+
+def _read_removal_seal(path: Path) -> RemovalSeal:
+    if path.is_symlink() or not path.is_file():
+        raise WsError(f"removal tombstone seal is not a regular file: {path}")
+    try:
+        return deserialize_removal_seal(path.read_text(encoding="utf-8"))
+    except (OSError, SerializationError) as exc:
+        raise WsError(f"cannot read removal seal {path}: {exc}") from exc
+
+
+def _validate_seal_consistency(
+    embedded: RemovalSeal | None,
+    standalone: RemovalSeal | None,
+) -> RemovalSeal:
+    if embedded is not None and standalone is not None and embedded != standalone:
+        raise WsError("embedded and standalone removal seals do not match")
+    seal = standalone or embedded
+    if seal is None:
+        raise WsError("removal tombstone has no valid removal seal")
+    return seal
+
+
+def _classify_removal_tombstone(paths: WorkspacePaths) -> _TombstoneClassification:
+    _validate_tombstone_cleanup_shape(paths)
+    if not any(paths.workspace.iterdir()):
+        return _TombstoneClassification(None, None, None, terminal=True)
+
+    standalone = (
+        _read_removal_seal(paths.removal_seal) if _path_present(paths.removal_seal) else None
+    )
+    lock = (
+        _read_metadata_file(paths.lock, deserialize_workspace_lock)
+        if _path_present(paths.lock)
+        else None
+    )
+    state = (
+        _read_metadata_file(paths.state, deserialize_workspace_state)
+        if _path_present(paths.state)
+        else None
+    )
+    embedded = state.removal.seal if state is not None and state.removal is not None else None
+    if standalone is not None:
+        seal = _validate_seal_consistency(embedded, standalone)
+        _validate_seal_metadata(lock, state, seal, paths)
+        _validate_monotonic_tombstone_shape(paths, lock, state)
+        return _TombstoneClassification(seal, lock, state)
+
+    if lock is None or state is None:
+        raise WsError("partial removal tombstone has no valid standalone seal")
+    if embedded is not None:
+        raise WsError("embedded-only v2 removal tombstone has no standalone seal")
+    if not state.removal or not state.removal._legacy_completed_without_seal:
+        raise WsError("removal tombstone is not a supported legacy completed shape")
+    _validate_lock_state_for_legacy(lock, state)
+    _validate_legacy_tombstone_shape(paths)
+    if state.removal is None or state.removal.phase != "removal_complete":
+        raise WsError("removal tombstone has no completed removal seal")
+    _verify_removal_complete(lock, state.removal)
+    return _TombstoneClassification(None, lock, state)
+
+
+def _validate_monotonic_tombstone_shape(
+    paths: WorkspacePaths,
+    lock: WorkspaceLock | None,
+    state: WorkspaceState | None,
 ) -> None:
-    paths.workspace.mkdir(parents=True, exist_ok=True)
+    """Reject filesystem states that cannot be suffixes of ordered cleanup."""
+
+    lock_present = _path_present(paths.lock)
+    state_present = _path_present(paths.state)
+    operation_present = _path_present(paths.operation_lock)
+    repos_present = _path_present(paths.workspace / "repos")
+    metadata_present = _path_present(paths.workspace / ".ws")
+    if lock_present and not state_present:
+        raise WsError("non-monotonic removal tombstone: lock remains after state removal")
+    if repos_present and not (lock_present and state_present):
+        raise WsError("non-monotonic removal tombstone: repository directory is out of order")
+    if (state_present or operation_present) and not metadata_present:
+        raise WsError("non-monotonic removal tombstone: metadata directory is missing")
+    if lock is not None and not lock_present:
+        raise WsError("removal lock metadata disappeared during classification")
+    if state is not None and not state_present:
+        raise WsError("removal state metadata disappeared during classification")
+
+
+def _validate_lock_state_for_legacy(lock: WorkspaceLock, state: WorkspaceState) -> None:
+    try:
+        validate_lock_state_consistency(lock, state)
+    except SerializationError as exc:
+        raise WsError(f"legacy removal lock/state metadata is inconsistent: {exc}") from exc
+
+
+def _validate_legacy_tombstone_shape(paths: WorkspacePaths) -> None:
+    entries = {entry.name for entry in paths.workspace.iterdir()}
+    if entries != {".ws", "repos", "workspace.lock.toml"}:
+        raise WsError("legacy removal tombstone is not a complete ordered shape")
+    metadata_entries = {entry.name for entry in (paths.workspace / ".ws").iterdir()}
+    if metadata_entries not in ({"state.toml"}, {"state.toml", "operation.lock"}):
+        raise WsError("legacy removal metadata is not a complete ordered shape")
+
+
+def _validate_seal_metadata(
+    lock: WorkspaceLock | None,
+    state: WorkspaceState | None,
+    seal: RemovalSeal,
+    paths: WorkspacePaths,
+) -> None:
+    workspace_name = paths.tombstone.name[1 : -len(".removing")]
+    if seal.workspace_name != workspace_name:
+        raise WsError("removal seal workspace name does not match tombstone")
+    normal_workspace = paths.root / workspace_name
+    if seal.workspace_path.resolve(strict=False) != normal_workspace.resolve(strict=False):
+        raise WsError("removal seal workspace path does not match tombstone")
+    if seal.tombstone_path.resolve(strict=False) != paths.tombstone.resolve(strict=False):
+        raise WsError("removal seal tombstone path does not match tombstone")
+    if lock is not None:
+        if lock.workspace_name != seal.workspace_name or set(lock.repos) != set(seal.repos):
+            raise WsError("removal seal does not match workspace lock identities")
+        for name, repo in seal.repos.items():
+            locked = lock.repos[name]
+            if (
+                locked.source_path.resolve(strict=False)
+                != repo.source_path.resolve(strict=False)
+                or locked.base_ref != repo.base_ref
+                or locked.base_commit != repo.base_commit
+                or locked.default_selector != repo.default_selector
+            ):
+                raise WsError(f"removal seal terminal identity does not match lock for {name!r}")
+    if state is not None:
+        if lock is not None:
+            try:
+                validate_lock_state_consistency(lock, state)
+            except SerializationError as exc:
+                raise WsError(f"removal lock/state metadata is inconsistent: {exc}") from exc
+        if state.workspace_name != seal.workspace_name or state.removal is None:
+            raise WsError("removal seal does not match workspace state")
+        if state.removal.phase != "removal_complete":
+            raise WsError("sealed removal tombstone has an incomplete removal phase")
+        if state.removal.seal is not None and state.removal.seal != seal:
+            raise WsError("embedded and standalone removal seals do not match")
+        if (
+            set(state.repos) != set(seal.repos)
+            or set(state.removal.repos) != set(seal.repos)
+        ):
+            raise WsError("removal seal repository identities do not match workspace state")
+        for name, record in state.removal.repos.items():
+            sealed = seal.repos[name]
+            saved = state.repos[name]
+            if (
+                not record.complete
+                or record.worktree_path.resolve(strict=False) != sealed.worktree_path.resolve(
+                    strict=False
+                )
+                or record.git_admin_path.resolve(strict=False) != sealed.git_admin_path.resolve(
+                    strict=False
+                )
+                or saved.mode != sealed.mode
+                or saved.head != sealed.head
+                or saved.branch != sealed.branch
+                or saved.detached != sealed.detached
+                or saved.dirty != sealed.dirty
+            ):
+                raise WsError(f"removal seal terminal identity does not match state for {name!r}")
+
+
+def _verify_seal_identities(paths: WorkspacePaths, seal: RemovalSeal) -> None:
+    _validate_seal_metadata(None, None, seal, paths)
+    for name, repo in seal.repos.items():
+        _check_removal_source(repo.source_path)
+        common_dir = Path(
+            run_git(["rev-parse", "--git-common-dir"], cwd=repo.source_path).stdout.strip()
+        )
+        if not common_dir.is_absolute():
+            common_dir = repo.source_path / common_dir
+        expected_admin_parent = common_dir.resolve(strict=False) / "worktrees"
+        if repo.git_admin_path.resolve(strict=False).parent != expected_admin_parent:
+            raise WsError(f"removal seal Git administrative identity does not match {name!r}")
+        expected_worktree = (seal.workspace_path / "repos" / name).resolve(strict=False)
+        if repo.worktree_path.resolve(strict=False) != expected_worktree:
+            raise WsError(f"removal seal worktree identity does not match {name!r}")
+        if _path_present(repo.worktree_path):
+            raise WsError(f"removed worktree path remains for {name!r}: {repo.worktree_path}")
+        if _path_present(repo.git_admin_path):
+            raise WsError(
+                f"Git administrative identity remains for {name!r}: {repo.git_admin_path}"
+            )
+        registered = [
+            entry
+            for entry in list_worktrees(repo.source_path)
+            if entry.path.resolve(strict=False) == repo.worktree_path.resolve(strict=False)
+        ]
+        if registered:
+            raise WsError(f"Git worktree registration remains for {name!r}")
+
+
+def _resume_sealed_tombstone_cleanup(paths: WorkspacePaths, seal: RemovalSeal | None) -> None:
+    _validate_tombstone_cleanup_shape(paths)
+    if seal is None:
+        if any(paths.workspace.iterdir()):
+            raise WsError("removal tombstone without a seal is not empty")
+        paths.workspace.rmdir()
+        _fsync_directory_checked(paths.tombstone.parent)
+        return
+    _verify_seal_identities(paths, seal)
+    _remove_if_present(paths.workspace / "repos", require_empty_directory=True)
+    metadata_present = _path_present(paths.lock) or _path_present(paths.state)
+    _remove_if_present(paths.lock, require_regular_file=True)
+    _remove_if_present(paths.state, require_regular_file=True)
+    if metadata_present:
+        _removal_test_boundary("legacy_metadata_deleted")
+    _remove_controlled_atomic_temps(paths)
+    _release_and_remove_operation_lock(paths)
+    _remove_if_present(paths.workspace / ".ws", require_empty_directory=True)
+    _fsync_directory_checked(paths.tombstone)
+    _remove_if_present(paths.removal_seal, require_regular_file=True)
+    _fsync_directory_checked(paths.tombstone)
+    _removal_test_boundary("seal_deleted")
+    try:
+        paths.tombstone.rmdir()
+    except OSError as exc:
+        raise WsError(
+            f"cannot remove non-empty removal tombstone {paths.tombstone}: {exc}"
+        ) from exc
+    _fsync_directory_checked(paths.tombstone.parent)
+
+
+def _validate_tombstone_cleanup_shape(paths: WorkspacePaths) -> None:
+    if paths.workspace.is_symlink() or not paths.workspace.is_dir():
+        raise WsError(f"removal tombstone is not a directory: {paths.workspace}")
+    allowed_top = {".ws", "repos", "workspace.lock.toml", "removal-seal.toml"}
+    for entry in paths.workspace.iterdir():
+        if entry.name not in allowed_top and not _is_controlled_temp(entry.name, "root"):
+            raise WsError(f"unexpected tombstone entry: {entry.name}")
+        if entry.name in {".ws", "repos"}:
+            if entry.is_symlink() or not entry.is_dir():
+                raise WsError(f"unexpected tombstone entry: {entry.name}")
+        elif entry.name in {"workspace.lock.toml", "removal-seal.toml"}:
+            _require_regular(entry, "tombstone metadata")
+        else:
+            _require_regular(entry, "tombstone temporary metadata")
     repos = paths.workspace / "repos"
+    if _path_present(repos) and any(repos.iterdir()):
+        raise WsError("unexpected tombstone entry in repos")
     metadata = paths.workspace / ".ws"
-    repos.mkdir(exist_ok=True)
-    metadata.mkdir(exist_ok=True)
-    lock = deserialize_workspace_lock(lock_text)
-    state = deserialize_workspace_state(state_text)
-    write_workspace_lock(paths.lock, lock)
-    write_workspace_state(paths.state, state)
-    if paths.operation_lock.exists() or paths.operation_lock.is_symlink():
-        if not paths.operation_lock.is_dir() or any(paths.operation_lock.iterdir()):
-            raise WsError(f"cannot reconstruct removal operation lock: {paths.operation_lock}")
-    else:
+    if not _path_present(metadata):
+        return
+    for entry in metadata.iterdir():
+        if entry.name not in {"state.toml", "operation.lock"} and not _is_controlled_temp(
+            entry.name, "state"
+        ):
+            raise WsError(f"unexpected tombstone metadata entry: {entry.name}")
+        if entry.name == "operation.lock":
+            if entry.is_symlink() or not entry.is_dir() or any(entry.iterdir()):
+                raise WsError(f"removal operation lock is not an empty directory: {entry}")
+        elif entry.name == "state.toml":
+            _require_regular(entry, "tombstone metadata")
+        else:
+            _require_regular(entry, "tombstone temporary metadata")
+
+
+def _remove_controlled_atomic_temps(paths: WorkspacePaths) -> None:
+    for directory in (paths.tombstone, paths.workspace / ".ws"):
+        if not directory.is_dir():
+            continue
+        kind = "root" if directory == paths.tombstone else "state"
+        for entry in tuple(directory.iterdir()):
+            if _is_controlled_temp(entry.name, kind):
+                _require_regular(entry, "tombstone temporary metadata")
+                entry.unlink()
+                _fsync_directory_checked(directory)
+
+
+def _is_controlled_temp(name: str, kind: str) -> bool:
+    target = {
+        "root": r"(?:workspace\.lock\.toml|removal-seal\.toml)",
+        "state": r"state\.toml",
+    }[kind]
+    return re.fullmatch(rf"{target}\.[0-9a-f]{{32}}\.tmp", name) is not None
+
+
+def _acquire_tombstone_operation_lock(paths: WorkspacePaths) -> bool:
+    metadata = paths.workspace / ".ws"
+    if not _path_present(metadata):
+        return False
+    if paths.operation_lock.is_symlink():
+        raise WsError(f"removal operation lock is not a directory: {paths.operation_lock}")
+    if paths.operation_lock.exists():
+        raise WsError(f"workspace operation lock already exists: {paths.operation_lock}")
+    try:
         paths.operation_lock.mkdir()
+    except FileExistsError as exc:
+        raise WsError(f"workspace operation lock already exists: {paths.operation_lock}") from exc
+    return True
+
+
+def _release_and_remove_operation_lock(paths: WorkspacePaths) -> None:
+    _remove_if_present(paths.operation_lock, require_empty_directory=True)
+
+
+def _read_metadata_file(path: Path, decoder):
+    try:
+        return decoder(path.read_text(encoding="utf-8"))
+    except (OSError, SerializationError) as exc:
+        raise WsError(f"cannot read workspace metadata: {exc}") from exc
+
+
+def _path_present(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _require_regular(path: Path, label: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise WsError(f"{label} is not a regular file: {path}")
+
+
+def _remove_if_present(
+    path: Path,
+    *,
+    require_empty_directory: bool = False,
+    require_regular_file: bool = False,
+) -> None:
+    if not _path_present(path):
+        return
+    if path.is_symlink():
+        raise WsError(f"refusing to remove symlink from tombstone: {path}")
+    if require_empty_directory:
+        if not path.is_dir() or any(path.iterdir()):
+            raise WsError(f"expected an empty directory in removal tombstone: {path}")
+        path.rmdir()
+    elif require_regular_file:
+        _require_regular(path, "tombstone metadata")
+        path.unlink()
+    else:
+        raise WsError(f"cleanup has no allowlisted operation for {path}")
+    _fsync_directory_checked(path.parent)
+
+
+def _fsync_directory_checked(directory: Path) -> None:
+    try:
+        fsync_directory(directory)
+    except OSError as exc:
+        raise WsError(f"cannot fsync affected directory {directory}: {exc}") from exc
 
 
 def _claim_source_commit(locked: WorkspaceLockRepo, source: str | None) -> str:
@@ -793,19 +1211,19 @@ def enter_context(repository_name: str, target_ref: str) -> str | None:
         lock, state = _read_metadata(paths)
         _validate_discovered_workspace_name(paths, lock)
         _reject_context_mutation_during_removal(state)
-        if state.phase in {"entering", "restoring"}:
-            raise WsError(
-                f"workspace has an interrupted context transition ({state.phase}); "
-                "manual recovery is required"
-            )
-        if state.phase in {"restore_conflicted", "restore_failed"}:
-            raise WsError(
-                f"workspace has an unresolved context transition ({state.phase}); "
-                "restore it before entering another context"
-            )
         locked = _locked_repo(lock, repository_name)
         saved = state.repos[repository_name]
-        if saved.context is not None or saved.mode == "context":
+        if saved.context is not None:
+            if saved.context.phase in {"entering", "restoring"}:
+                raise WsError(
+                    f"repository {repository_name!r} has an interrupted context transition "
+                    f"({saved.context.phase}); manual recovery is required"
+                )
+            if saved.context.phase in {"restore_conflicted", "restore_failed"}:
+                raise WsError(
+                    f"repository {repository_name!r} has an unresolved context transition "
+                    f"({saved.context.phase}); restore it before entering another context"
+                )
             raise WsError(
                 f"repository {repository_name!r} already has an active temporary context; "
                 f"restore it first with: ws context {repository_name} --restore"
@@ -831,7 +1249,6 @@ def enter_context(repository_name: str, target_ref: str) -> str | None:
             repository_name,
             saved,
             context,
-            workspace_phase="entering",
             mode="context",
             head=live["head"],
             branch=live["branch"],
@@ -869,12 +1286,12 @@ def enter_context(repository_name: str, target_ref: str) -> str | None:
                 repository_name,
                 current.repos[repository_name],
                 context,
-                workspace_phase="entering",
                 mode="context",
                 head=live["head"],
                 branch=live["branch"],
                 dirty=False,
             )
+            write_workspace_state(paths.state, current)
             current = _context_effect_outcome(
                 paths,
                 current,
@@ -951,7 +1368,6 @@ def enter_context(repository_name: str, target_ref: str) -> str | None:
             repository_name,
             current.repos[repository_name],
             final_context,
-            workspace_phase="active",
             mode="context",
             head=final_live["head"],
             branch=None,
@@ -982,7 +1398,7 @@ def restore_context(repository_name: str) -> str | None:
         locked = _locked_repo(lock, repository_name)
         saved = state.repos[repository_name]
         context = saved.context
-        if context is None or saved.mode != "context":
+        if context is None:
             raise WsError(f"repository {repository_name!r} has no active temporary context")
         if context.phase in {"entering", "restoring"}:
             raise WsError(
@@ -1011,7 +1427,6 @@ def restore_context(repository_name: str) -> str | None:
             repository_name,
             saved,
             replace(context, phase="restoring"),
-            workspace_phase="restoring",
             mode="context",
             head=saved.head,
             branch=None,
@@ -1083,7 +1498,6 @@ def restore_context(repository_name: str) -> str | None:
                         repository_name,
                         current.repos[repository_name],
                         failed_context,
-                        workspace_phase="restore_conflicted",
                         mode="context",
                         head=context.return_saved_head,
                         branch=context.return_branch,
@@ -1103,7 +1517,6 @@ def restore_context(repository_name: str) -> str | None:
                     repository_name,
                     current.repos[repository_name],
                     failed_context,
-                    workspace_phase="restore_failed",
                     mode="context",
                     head=context.return_saved_head,
                     branch=context.return_branch,
@@ -1154,21 +1567,15 @@ def restore_context(repository_name: str) -> str | None:
                 known_oids={"stash": context.stash_oid or return_head},
             )
         final_live = _read_live_repo(worktree)
-        restored = replace(
+        restored = _set_context_state(
             current,
-            phase="idle",
-            repos={
-                **current.repos,
-                repository_name: RepoState(
-                    name=repository_name,
-                    mode=context.return_mode,
-                    head=final_live["head"],
-                    branch=final_live["branch"],
-                    detached=final_live["detached"],
-                    dirty=final_live["dirty"],
-                    context=None,
-                ),
-            },
+            repository_name,
+            current.repos[repository_name],
+            None,
+            mode=context.return_mode,
+            head=final_live["head"],
+            branch=final_live["branch"],
+            dirty=final_live["dirty"],
         )
         write_workspace_state(paths.state, restored)
         if context.stash_oid is not None:
@@ -1232,21 +1639,15 @@ def finalize_restore(repository_name: str) -> str | None:
             known_oids={"stash": context.stash_oid},
         )
         live = _read_live_repo(worktree)
-        finalized = replace(
+        finalized = _set_context_state(
             current,
-            phase="idle",
-            repos={
-                **current.repos,
-                repository_name: RepoState(
-                    name=repository_name,
-                    mode=context.return_mode,
-                    head=live["head"],
-                    branch=live["branch"],
-                    detached=live["detached"],
-                    dirty=live["dirty"],
-                    context=None,
-                ),
-            },
+            repository_name,
+            current.repos[repository_name],
+            None,
+            mode=context.return_mode,
+            head=live["head"],
+            branch=live["branch"],
+            dirty=live["dirty"],
         )
         write_workspace_state(paths.state, finalized)
         message = f"ws-context:{lock.workspace_name}:{repository_name}:{context.stash_token}"
@@ -1303,9 +1704,8 @@ def _set_context_state(
     state: WorkspaceState,
     repository_name: str,
     saved: RepoState,
-    context: ContextState,
+    context: ContextState | None,
     *,
-    workspace_phase: str,
     mode: str,
     head: str | None,
     branch: str | None,
@@ -1320,11 +1720,7 @@ def _set_context_state(
         dirty=dirty,
         context=context,
     )
-    return replace(
-        state,
-        phase=workspace_phase,
-        repos={**state.repos, repository_name: repo},
-    )
+    return replace(state, repos={**state.repos, repository_name: repo})
 
 
 def _context_effect_intent(
@@ -1395,7 +1791,8 @@ def _persist_context_effect(
     expected_refs: dict[str, str] | None = None,
     known_oids: dict[str, str] | None = None,
 ) -> WorkspaceState:
-    saved = state.repos[repository_name]
+    _, latest = _read_metadata(paths)
+    saved = latest.repos[repository_name]
     context = saved.context
     assert context is not None
     effect = ContextSideEffect(
@@ -1406,7 +1803,7 @@ def _persist_context_effect(
     )
     updated_context = replace(context, completed_effects=(*context.completed_effects, effect))
     updated = replace(
-        state, repos={**state.repos, repository_name: replace(saved, context=updated_context)}
+        latest, repos={**latest.repos, repository_name: replace(saved, context=updated_context)}
     )
     write_workspace_state(paths.state, updated)
     return updated
@@ -1568,6 +1965,7 @@ def _paths(root: Path, name: str) -> WorkspacePaths:
         tombstone=root / f".{name}.removing",
         lifecycle_lock=root / f".{name}.lifecycle.lock",
         operation_lock=workspace / ".ws" / "operation.lock",
+        removal_seal=workspace / "removal-seal.toml",
     )
 
 
@@ -1613,25 +2011,12 @@ def _default_selector(source: Path, configured: str | None) -> str | None:
 
 
 def _remote_symbolic_selector(source: Path) -> str | None:
-    result = run_git(
-        ["for-each-ref", "--format=%(refname) %(symref)", "refs/remotes"],
-        cwd=source,
-        check=False,
-    )
-    targets: list[tuple[str, str]] = []
-    for line in result.stdout.splitlines():
-        parts = line.split(maxsplit=1)
-        if len(parts) != 2 or not parts[0].endswith("/HEAD") or not parts[1]:
-            continue
-        target = parts[1].removeprefix("refs/remotes/")
-        branch = target.split("/", 1)[1] if "/" in target else target
-        targets.append((branch, target))
-    if not targets:
+    heads = remote_symbolic_heads(source)
+    if not heads:
         return None
-    branches = {branch for branch, _target in targets}
-    if len(branches) != 1:
+    if len({commit for _head, _target, commit in heads}) != 1:
         raise ConfigError(f"remote symbolic HEADs disagree for source {source}")
-    return targets[0][1]
+    return min(target for _head, target, _commit in heads)
 
 
 def _resolve_commit(source: Path, ref: str) -> str:

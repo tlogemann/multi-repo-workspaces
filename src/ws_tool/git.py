@@ -3,11 +3,11 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from .errors import GitCommandError, GitWorktreeError
+from .errors import ConfigError, GitCommandError, GitWorktreeError
 
 _GIT_ROUTING_ENVIRONMENT = frozenset(
     {
@@ -50,6 +50,9 @@ class WorktreeIdentity:
     source_git_common_dir: Path
 
 
+RemoteSymbolicHead = tuple[str, str, str]
+
+
 def run_git(
     args: Iterable[str | Path],
     *,
@@ -88,6 +91,51 @@ def run_git(
             result.stderr,
         )
     return result
+
+
+def remote_symbolic_heads(source: Path) -> Sequence[RemoteSymbolicHead]:
+    """Return remote symbolic HEADs and the commits to which they resolve."""
+
+    try:
+        result = run_git(
+            [
+                "for-each-ref",
+                "--format=%(refname)%09%(symref)",
+                "refs/remotes",
+            ],
+            cwd=source,
+        )
+    except GitCommandError as exc:
+        raise ConfigError(f"cannot enumerate remote symbolic HEADs in {source}: {exc}") from exc
+
+    heads: list[RemoteSymbolicHead] = []
+    for row in result.stdout.splitlines():
+        try:
+            head_ref, target_ref = row.split("\t", 1)
+        except ValueError as exc:
+            raise ConfigError(
+                f"malformed remote symbolic HEAD output in {source}: {row!r}"
+            ) from exc
+        if not head_ref.endswith("/HEAD") or not target_ref:
+            continue
+        try:
+            resolved = run_git(
+                ["rev-parse", "--verify", f"{target_ref}^{{commit}}"],
+                cwd=source,
+            )
+        except GitCommandError as exc:
+            raise ConfigError(
+                f"remote symbolic HEAD {head_ref} target {target_ref!r} "
+                f"does not resolve to a commit in {source}: {exc}"
+            ) from exc
+        commit_oid = resolved.stdout.strip()
+        if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit_oid) is None:
+            raise ConfigError(
+                f"remote symbolic HEAD {head_ref} target {target_ref!r} "
+                f"resolved to malformed commit ID in {source}: {commit_oid!r}"
+            )
+        heads.append((head_ref, target_ref, commit_oid))
+    return tuple(heads)
 
 
 def create_private_ref(ref: str, oid: str, *, cwd: Path | None = None) -> None:

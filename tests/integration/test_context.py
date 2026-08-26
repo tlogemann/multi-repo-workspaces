@@ -47,12 +47,33 @@ def write_config(path: Path, source: Path, *, default_branch: str | None = None)
     return path
 
 
+def write_two_repo_config(path: Path, app_source: Path, api_source: Path) -> Path:
+    path.write_text(
+        '[project]\nworkspace_root = "../workspaces"\n\n'
+        f'[repos."app"]\npath = {json.dumps(str(app_source))}\n\n'
+        f'[repos."api"]\npath = {json.dumps(str(api_source))}\n',
+        encoding="utf-8",
+    )
+    return path
+
+
 def create_workspace(
     tmp_path: Path, source: Path, name: str, *, default_branch: str | None = None
 ) -> Path:
     config_dir = tmp_path / f"config-{name}"
     config_dir.mkdir()
     config = write_config(config_dir / "ws.toml", source, default_branch=default_branch)
+    result = run_ws(config_dir, "create", name, "--config", str(config))
+    assert result.returncode == 0, result.stderr
+    return tmp_path / "workspaces" / name
+
+
+def create_two_repo_workspace(
+    tmp_path: Path, app_source: Path, api_source: Path, name: str
+) -> Path:
+    config_dir = tmp_path / f"config-{name}"
+    config_dir.mkdir()
+    config = write_two_repo_config(config_dir / "ws.toml", app_source, api_source)
     result = run_ws(config_dir, "create", name, "--config", str(config))
     assert result.returncode == 0, result.stderr
     return tmp_path / "workspaces" / name
@@ -109,7 +130,7 @@ def test_clean_claimed_context_uses_locked_default_and_restores_branch(
     state = deserialize_workspace_state((workspace / ".ws" / "state.toml").read_text())
     context = state.repos["app"].context
     assert context is not None
-    assert state.phase == "active"
+    assert state.phase == "idle"
     assert state.repos["app"].mode == "context"
     assert context.return_branch == "feature/foo"
     assert context.return_saved_head == saved_head
@@ -124,6 +145,65 @@ def test_clean_claimed_context_uses_locked_default_and_restores_branch(
     restored_state = deserialize_workspace_state((workspace / ".ws" / "state.toml").read_text())
     assert restored_state.phase == "idle"
     assert restored_state.repos["app"].context is None
+
+
+def test_context_is_independent_per_repository(tmp_path: Path, git_repo) -> None:
+    app_source = git_repo("context-two-app")
+    api_source = git_repo("context-two-api")
+    workspace = create_two_repo_workspace(tmp_path, app_source.path, api_source.path, "two-repos")
+    app_worktree = workspace / "repos" / "app"
+    api_worktree = workspace / "repos" / "api"
+
+    assert run_ws(app_worktree, "context", "app", "HEAD").returncode == 0
+    assert run_ws(api_worktree, "context", "api", "HEAD").returncode == 0
+
+    restored_app = run_ws(app_worktree, "context", "app", "--restore")
+    assert restored_app.returncode == 0, restored_app.stderr
+    status_result = run_ws(app_worktree, "status", "--json")
+    assert status_result.returncode == 0, status_result.stderr
+    status = json.loads(status_result.stdout)
+    assert status["repos"]["app"]["context"] is None
+    assert status["repos"]["api"]["context"]["phase"] == "active"
+
+    removal_with_api_context = run_ws(app_worktree, "remove", "two-repos")
+    assert removal_with_api_context.returncode != 0
+    assert "context" in removal_with_api_context.stderr
+
+    claimed_app = run_ws(
+        app_worktree, "claim", "app", "--target", "feature/context-two-app"
+    )
+    assert claimed_app.returncode == 0, claimed_app.stderr
+    rejected_api_claim = run_ws(
+        api_worktree, "claim", "api", "--target", "feature/context-two-api"
+    )
+    assert rejected_api_claim.returncode != 0
+    assert "context" in rejected_api_claim.stderr
+
+    assert run_ws(app_worktree, "context", "app", "HEAD").returncode == 0
+    state_path = workspace / ".ws" / "state.toml"
+    state = deserialize_workspace_state(state_path.read_text(encoding="utf-8"))
+    app_state = state.repos["app"]
+    assert app_state.context is not None
+    interrupted = replace(
+        state,
+        repos={
+            **state.repos,
+            "app": replace(app_state, context=replace(app_state.context, phase="entering")),
+        },
+    )
+    state_path.write_text(serialize_workspace_state(interrupted), encoding="utf-8")
+
+    restored_api = run_ws(api_worktree, "context", "api", "--restore")
+    assert restored_api.returncode == 0, restored_api.stderr
+    status_result = run_ws(app_worktree, "status", "--json")
+    assert status_result.returncode == 0, status_result.stderr
+    status = json.loads(status_result.stdout)
+    assert status["repos"]["api"]["context"] is None
+    assert status["repos"]["app"]["context"]["phase"] == "entering"
+
+    removal = run_ws(app_worktree, "remove", "two-repos")
+    assert removal.returncode != 0
+    assert "context" in removal.stderr
 
 
 def test_dirty_claimed_context_preserves_changes_and_unrelated_newer_stash(
@@ -558,7 +638,7 @@ def test_restore_failed_requires_clean_baseline_then_retries_pinned_snapshot(
         workspace_module.restore_context("app")
 
     failed_state = deserialize_workspace_state((workspace / ".ws" / "state.toml").read_text())
-    assert failed_state.phase == "restore_failed"
+    assert failed_state.phase == "idle"
     assert failed_state.repos["app"].context is not None
     retried = workspace_module.restore_context("app")
 
@@ -586,7 +666,7 @@ def test_interrupted_context_transition_blocks_mutation(
     interrupted_context = replace(context, phase=phase)
     interrupted = replace(
         state,
-        phase=phase,
+        phase="idle",
         repos={"app": replace(repo, context=interrupted_context)},
     )
     state_path.write_text(serialize_workspace_state(interrupted), encoding="utf-8")

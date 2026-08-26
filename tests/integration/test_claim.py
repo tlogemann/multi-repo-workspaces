@@ -335,7 +335,7 @@ def test_claim_refuses_context_and_removal_states(tmp_path: Path, git_repo) -> N
     context_workspace = create_workspace(tmp_path, source.path, "context", config)
     context_state = WorkspaceState(
         workspace_name="context",
-        phase="active",
+        phase="idle",
         repos={
             "app": RepoState(
                 name="app",

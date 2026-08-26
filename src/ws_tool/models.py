@@ -4,13 +4,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 WORKSPACE_LOCK_SCHEMA_VERSION = 1
-WORKSPACE_STATE_SCHEMA_VERSION = 1
+WORKSPACE_STATE_SCHEMA_VERSION = 2
+REMOVAL_SEAL_SCHEMA_VERSION = 1
 CONTEXT_PHASES = frozenset(
     {"entering", "active", "restoring", "restore_conflicted", "restore_failed"}
 )
 REMOVAL_PHASES = frozenset({"removing", "removal_complete"})
 REPO_MODES = frozenset({"claimed", "detached", "context"})
-WORKSPACE_PHASES = CONTEXT_PHASES | REMOVAL_PHASES | {"idle"}
+WORKSPACE_PHASES = frozenset({"idle"}) | REMOVAL_PHASES
 
 
 @dataclass(frozen=True)
@@ -77,11 +78,19 @@ class RepoState:
 
 
 @dataclass(frozen=True)
-class RemovalState:
-    phase: str
-    workspace_path: Path
-    tombstone_path: Path
-    repos: dict[str, RemovalRepoState]
+class RemovalSealRepo:
+    name: str
+    source_path: Path
+    worktree_path: Path
+    git_admin_path: Path
+    base_ref: str
+    base_commit: str
+    default_selector: str | None
+    mode: str
+    head: str | None
+    branch: str | None
+    detached: bool
+    dirty: bool
 
 
 @dataclass(frozen=True)
@@ -90,6 +99,26 @@ class RemovalRepoState:
     worktree_path: Path
     git_admin_path: Path
     complete: bool
+
+
+@dataclass(frozen=True)
+class RemovalSeal:
+    workspace_name: str
+    workspace_path: Path
+    tombstone_path: Path
+    repos: dict[str, RemovalSealRepo]
+    phase: str = "removal_complete"
+    schema_version: int = REMOVAL_SEAL_SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class RemovalState:
+    phase: str
+    workspace_path: Path
+    tombstone_path: Path
+    repos: dict[str, RemovalRepoState]
+    seal: RemovalSeal | None = None
+    _legacy_completed_without_seal: bool = field(default=False, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
