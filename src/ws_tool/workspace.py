@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +8,8 @@ from .config import load_config, parse_source_overrides
 from .errors import ConfigError, GitWorktreeError, SerializationError, WsError
 from .git import repository_kind, run_git, validate_worktree_registration
 from .models import (
+    CONTEXT_PHASES,
+    REMOVAL_PHASES,
     RepoState,
     WorkspaceLock,
     WorkspaceLockRepo,
@@ -218,6 +220,137 @@ def create_workspace(
                 paths.root.rmdir()
             except OSError:
                 pass
+
+
+def claim_workspace(
+    repository_name: str,
+    *,
+    source: str | None = None,
+    target: str | None = None,
+) -> None:
+    validate_logical_name(repository_name, kind="repository")
+    paths = discover_workspace()
+    lifecycle_acquired = False
+    operation_acquired = False
+    try:
+        try:
+            paths.lifecycle_lock.mkdir()
+            lifecycle_acquired = True
+        except FileExistsError as exc:
+            raise WsError(
+                f"workspace lifecycle lock already exists: {paths.lifecycle_lock}"
+            ) from exc
+        try:
+            paths.operation_lock.mkdir()
+            operation_acquired = True
+        except FileExistsError as exc:
+            raise WsError(
+                f"workspace operation lock already exists: {paths.operation_lock}"
+            ) from exc
+
+        lock, state = _read_metadata(paths)
+        _validate_discovered_workspace_name(paths, lock)
+        if state.removal is not None or state.phase in REMOVAL_PHASES:
+            raise WsError(
+                f"cannot claim repository while workspace removal is durable: {paths.workspace}"
+            )
+        if state.phase in CONTEXT_PHASES:
+            raise WsError(
+                f"cannot claim repository while workspace context phase is {state.phase!r}"
+            )
+        locked = lock.repos.get(repository_name)
+        if locked is None:
+            raise WsError(
+                f"repository {repository_name!r} is not part of workspace {lock.workspace_name!r}"
+            )
+        saved = state.repos[repository_name]
+        if saved.context is not None or saved.mode == "context":
+            raise WsError(f"repository {repository_name!r} has an active context; restore it first")
+
+        worktree = paths.workspace / "repos" / repository_name
+        validate_worktree_registration(locked.source_path, worktree)
+        live = _read_live_repo(worktree)
+        requested_target = (
+            target if target is not None else f"ws/{lock.workspace_name}/{repository_name}"
+        )
+        _validate_claim_target(requested_target)
+
+        current_branch = live["branch"]
+        if current_branch == requested_target:
+            _write_claimed_state(paths, state, repository_name, saved, live)
+            return
+        if current_branch is not None:
+            raise WsError(
+                f"repository {repository_name!r} is already claimed on branch {current_branch!r}"
+            )
+
+        existing = run_git(
+            ["show-ref", "--verify", "--quiet", f"refs/heads/{requested_target}"],
+            cwd=worktree,
+            check=False,
+        )
+        if existing.returncode == 0:
+            raise WsError(f"claim target branch already exists: {requested_target}")
+        if existing.returncode != 1:
+            raise WsError(f"could not check whether claim target branch exists: {requested_target}")
+
+        source_commit = _claim_source_commit(locked, source)
+        run_git(["switch", "--create", requested_target, source_commit], cwd=worktree)
+        claimed = _read_live_repo(worktree)
+        _write_claimed_state(paths, state, repository_name, saved, claimed)
+    finally:
+        if operation_acquired:
+            _release_operation_lock(paths.operation_lock)
+        if lifecycle_acquired:
+            _release_lifecycle_lock(paths.lifecycle_lock)
+
+
+def _claim_source_commit(locked: WorkspaceLockRepo, source: str | None) -> str:
+    if source is None:
+        return locked.base_commit
+    if source == "default":
+        if locked.default_selector is None:
+            raise WsError(
+                f"repository {locked.name!r} has no locked default selector; "
+                "provide an explicit --source ref"
+            )
+        return _resolve_commit(locked.source_path, locked.default_selector)
+    return _resolve_commit(locked.source_path, source)
+
+
+def _validate_claim_target(target: str) -> None:
+    result = run_git(["check-ref-format", "--branch", target], check=False)
+    if result.returncode != 0:
+        raise WsError(f"invalid claim target branch {target!r}")
+
+
+def _write_claimed_state(
+    paths: WorkspacePaths,
+    state: WorkspaceState,
+    repository_name: str,
+    saved: RepoState,
+    live: dict[str, Any],
+) -> None:
+    claimed = replace(
+        saved,
+        mode="claimed",
+        head=live["head"],
+        branch=live["branch"],
+        detached=False,
+        dirty=live["dirty"],
+        context=None,
+    )
+    write_workspace_state(
+        paths.state, replace(state, repos={**state.repos, repository_name: claimed})
+    )
+
+
+def _validate_discovered_workspace_name(paths: WorkspacePaths, lock: WorkspaceLock) -> None:
+    if lock.workspace_name != paths.workspace.name:
+        raise WsError(
+            f"workspace name in lock {lock.workspace_name!r} does not match directory "
+            f"{paths.workspace.name!r}"
+        )
 
 
 def status_workspace(start: Path | None = None) -> dict[str, Any]:

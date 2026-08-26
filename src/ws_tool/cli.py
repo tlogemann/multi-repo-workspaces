@@ -6,7 +6,7 @@ import sys
 from collections.abc import Sequence
 
 from .errors import WsError
-from .workspace import create_workspace, render_status_human, status_workspace
+from .workspace import claim_workspace, create_workspace, render_status_human, status_workspace
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="show workspace state")
     status.add_argument("--json", action="store_true")
 
-    claim = commands.add_parser("claim", help="claim a repository (future phase)")
+    claim = commands.add_parser("claim", help="claim a repository")
     claim.add_argument("repo")
     claim.add_argument("--source")
     claim.add_argument("--target")
@@ -70,6 +70,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
             else:
                 print(render_status_human(payload))
+            return 0
+        if args.command == "claim":
+            claim_workspace(args.repo, source=args.source, target=args.target)
+            print(f"Claimed repository {args.repo}")
             return 0
         print(f"ws {args.command} is not implemented in Phase 2A", file=sys.stderr)
         return 2
