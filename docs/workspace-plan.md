@@ -134,6 +134,8 @@ Use a project-level TOML configuration named `ws.toml`.
 For example:
 
 ```toml
+default_ref = "main"
+
 [project]
 workspace_root = "../workspaces"
 
@@ -142,10 +144,60 @@ path = "../repos/app"
 
 [repos.library]
 path = "../repos/library"
-default_branch = "develop"
+default_ref = "develop"
 
 [repos.tools]
 path = "../repos/tools"
+```
+
+The root-level `default_ref` is the global default for repositories that do
+not define their own value. For example, a global-only configuration is:
+
+```toml
+default_ref = "main"
+
+[project]
+workspace_root = "../workspaces"
+
+[repos.app]
+path = "../repos/app"
+
+[repos.library]
+path = "../repos/library"
+```
+
+Per-repository values override the global value independently:
+
+```toml
+default_ref = "main"
+
+[project]
+workspace_root = "../workspaces"
+
+[repos.app]
+path = "../repos/app"
+default_ref = "develop"
+
+[repos.library]
+path = "../repos/library"
+
+[repos.tools]
+path = "../repos/tools"
+default_ref = "trunk"
+```
+
+Here `app` uses `develop`, `library` falls back to the global `main`, and
+`tools` uses `trunk`. Fully automatic behavior leaves both levels unset:
+
+```toml
+[project]
+workspace_root = "../workspaces"
+
+[repos.app]
+path = "../repos/app"
+
+[repos.library]
+path = "../repos/library"
 ```
 
 Requirements:
@@ -155,7 +207,9 @@ Requirements:
 * `path` points to an existing Git repository;
 * relative paths are resolved relative to the configuration file;
 * `workspace_root` controls where logical workspaces are created;
-* `default_branch` is optional.
+* `default_ref` is optional at the global root and for each repository.
+  Only this key is accepted for default-ref configuration; other key names are
+  invalid and are not aliases or migration forms.
 
 `ws create <workspace>` and `ws remove <workspace>` use `./ws.toml` by
 default and accept `--config PATH`. They must not search upward for a config
@@ -165,8 +219,25 @@ the config. `remove` may therefore run inside the named workspace using
 discovery, or otherwise uses the explicitly selected/default config. No
 command globally scans the filesystem.
 
-Default branch detection must be robust. Resolve and record each repository's
-default-branch selector independently from the creation base/source ref.
+Default-ref detection must be robust. Resolve and record each repository's
+effective default ref independently from the creation base/source ref. The
+effective-default precedence for each repository is, in order:
+
+1. the per-repository `default_ref`, if present;
+2. the global root-level `default_ref`, if present;
+3. existing automatic default-ref discovery, only if neither configuration
+   level supplied a value.
+
+Backward compatibility is explicit: when no global `default_ref` is present,
+any existing per-repository `default_ref` remains that repository's effective
+default. When neither the global nor repository level supplies `default_ref`,
+the pre-existing automatic discovery behavior is retained.
+
+An explicit value at either configuration level is authoritative for its
+repository. If it cannot be resolved there, report an affected-repository
+error and do not fall back to automatic discovery. A configured value is
+resolved with `git rev-parse --verify <value>^{commit}` and may be a branch,
+tag, remote-tracking ref, or full/abbreviated commit ID.
 
 Prefer Git-native information such as:
 
@@ -176,20 +247,21 @@ git symbolic-ref refs/remotes/origin/HEAD
 
 where available.
 
-Use this exact fallback order:
+When neither configuration level supplied a value, use this exact automatic
+fallback order:
 
-1. the configured `default_branch`, if present;
-2. a unique remote symbolic HEAD (for example `origin/HEAD`); fail if
+1. a unique remote symbolic HEAD (for example `origin/HEAD`), but only when
+   neither configuration level supplied `default_ref`; fail if
    remotes disagree;
-3. the currently checked-out branch of a non-bare source repository;
-4. a clear error when no unambiguous branch exists.
+2. the currently checked-out branch of a non-bare source repository;
+3. a clear error when no unambiguous branch exists.
 
 Bare source repositories are supported, but cannot use a checked-out branch
 for this fallback. Never guess a branch name such as `main` or `master`.
 
 Do not blindly assume `main` or `master`.
 
-If the default branch cannot be determined unambiguously, record a null
+If the auto-discovered default ref cannot be determined unambiguously, record a null
 selector and fail with a clear error only when an operation actually requires
 `default`. Creation may continue when its base/source ref is explicit.
 
@@ -213,23 +285,28 @@ Workspace removal preflights source availability before removing any worktree.
 **No automatic cloning.** Users are expected to clone or set up repositories
 before defining them in `ws.toml`.
 
-### 4c. Default branch resolution details
+### 4c. Default ref resolution details
 
-The configured `default_branch` value, when present, is resolved as a Git ref
-in the source repository at workspace creation time. It is stored as-is in the
-lock file's `default_selector`. It is not required to be a branch name; any
-resolvable Git ref (branch, tag, remote-tracking ref, abbreviated SHA) is
+The selected configured `default_ref` value, when present at either the
+per-repository or global level, is resolved as a Git ref in the source
+repository at workspace creation time. It is stored as-is in the lock file's
+`default_selector`. It is not required to be a branch name; any resolvable Git
+ref (branch, tag, remote-tracking ref, full/abbreviated commit ID) is
 acceptable, provided `git rev-parse --verify <value>^{commit}` succeeds in the
-source repository.
+source repository. A configured value that fails this check is an
+authoritative error for that repository; it must not trigger discovery, and
+workspace creation fails.
 
-For multi-remote repositories, `_remote_symbolic_selector` considers **all**
-`refs/remotes/*/HEAD` entries. If exactly one distinct commit is reachable from
-all remote symbolic HEAD targets, the alphabetically smallest target branch name
-is selected (for determinism). If different commits are reachable, the tool
-errors with "remote symbolic HEADs disagree" rather than picking one. This means
-a repository with only an `origin` remote behaves predictably; a repository with
-multiple remotes that point to different default branches also fails predictably
-rather than silently picking one.
+For multi-remote repositories without either configured `default_ref`,
+`_remote_symbolic_selector` considers **all** `refs/remotes/*/HEAD` entries. If
+exactly one distinct commit is reachable from all remote symbolic HEAD targets,
+the alphabetically smallest target branch name is selected (for determinism).
+If different commits are reachable, the tool errors with "remote symbolic
+HEADs disagree" rather than picking one. Automatic multi-remote discovery is
+skipped whenever either configuration level supplied a value. This means a
+repository with only an `origin` remote behaves predictably, while a repository
+with multiple remotes that point to different default refs fails predictably
+only in the fully automatic case.
 
 ---
 
@@ -257,7 +334,7 @@ The command should:
 6. synthesize `ws/<workspace-name>/<repo-name>` for each repository and
    validate it with `git check-ref-format --branch`;
 7. determine the source ref for each repository;
-8. resolve every source ref and every available default selector before
+8. resolve every source ref and every effective default selector before
    changing worktree/source content or metadata state (the lifecycle lock is
    synchronization bookkeeping as specified below);
 9. create:
@@ -284,12 +361,15 @@ do not automatically initialize or alter them. If the target workspace path
 or its deterministic `.removing/` tombstone already exists, fail before
 mutation: do not clean it up, reuse it, or repair it.
 
-For every repository, resolve and lock the nullable default-branch selector
-separately from the base/source ref when it is available, even when creation
-uses a source override or tag. For a bare source without an explicit selector
-or unambiguous remote symbolic HEAD, record a null selector (omit the optional
-TOML key); do not invent one. Creation must still succeed when every repository has an explicit
-source override, even if all default selectors are null.
+For every repository, resolve and lock the nullable default selector separately
+from the base/source ref when it is available, even when creation uses a source
+override or tag. A source override does not alter effective-default precedence:
+the repository's configured `default_ref`, then the global `default_ref`, then
+automatic discovery are still used for the locked selector. For a bare source
+without a configured selector or unambiguous automatic discovery, record a
+null selector (omit the optional TOML key); do not invent one. Creation must
+still succeed when every repository has an explicit source override, even if
+all default selectors are null.
 
 Example conceptual lock data:
 
@@ -315,7 +395,7 @@ The schema may differ, but preserve these concepts:
 * source repository path;
 * requested base/source ref;
 * immutable resolved base commit;
-* nullable resolved default-branch selector, independent of `base_ref`;
+* nullable resolved default selector, independent of `base_ref`;
 * repository logical name;
 * a schema version;
 * absolute canonical source paths.
@@ -324,6 +404,17 @@ The workspace lock is self-contained and remains authoritative after
 `ws.toml` is moved or deleted. Workspace-local commands use the lock and
 state. Configuration is required only to create a workspace or to locate a
 workspace from outside it.
+
+Locks persist each repository's resolved default selector independently of
+later configuration or source-ref changes.
+
+Workspace-local `status` is lock-based: it must not re-resolve the current
+configuration or replace a locked selector. A config-resolving read-only view
+must instead report an affected-repository configuration error when a
+configured ref cannot resolve,
+continue reporting other independent repositories, and preserve the command's
+non-zero aggregated result. A configured error is never converted into an
+automatic-discovery result.
 
 Do not rely on branch refs continuing to point at the same commit later.
 
@@ -352,7 +443,8 @@ Parse every `repo=ref` strictly before resolving refs or mutating anything:
 reject malformed pairs, unknown repository names, empty refs, and duplicate
 overrides. Resolve all validated overrides before worktree creation.
 
-Others use their independently resolved and locked default selector; if it is
+Others use their independently resolved and locked effective default selector;
+source overrides do not change that precedence. If it is
 null, creation fails clearly because that repository has no explicit base
 source.
 
@@ -392,7 +484,7 @@ ws claim app
 
 must create the editable branch from the **workspace's locked base commit for that repository**.
 
-This is intentionally different from resolving the repository's default branch again.
+This is intentionally different from resolving the repository's default ref again.
 
 The reason is reproducibility:
 
@@ -446,7 +538,7 @@ ws claim app --source default
 
 This special keyword means:
 
-> Resolve the repository's locked default branch selector now and use its
+> Resolve the repository's locked default selector now and use its
 > current commit as the source. In a workspace-local command, use the
 > repository's independently locked selector when `ws.toml` is unavailable;
 > if that selector is null, fail clearly; do not substitute the workspace's
@@ -655,7 +747,7 @@ Also reserve:
 ws context <repo> default
 ```
 
-to mean the repository's locked current default-branch selector.
+to mean the repository's locked current default selector.
 
 For workspace-local context, `default` resolves the repository's locked
 default selector, not its locked creation/source ref, so this remains usable
@@ -672,7 +764,7 @@ roughly means:
 
 ```text
 save current workspace repository state
-resolve default branch
+resolve the locked default selector
 temporarily switch to its commit using detached HEAD
 ```
 
@@ -780,7 +872,7 @@ uncommitted changes
 ws context app default
 ↓
 changes safely stored
-default branch commit checked out detached
+default-ref commit checked out detached
 ↓
 test something
 ↓
@@ -1049,7 +1141,7 @@ Show at least:
 * workspace name;
 * repository;
 * locked source/base ref;
-* locked default-branch selector;
+* locked default selector;
 * locked base commit;
 * current HEAD;
 * detached vs claimed;
@@ -1085,6 +1177,13 @@ Return stable structured data suitable for coding agents.
 
 On success, `--json` writes JSON only to stdout. Errors use concise stderr
 diagnostics and a non-zero exit status; v1 has no JSON error protocol.
+
+The ordinary workspace-local status view reads only the lock and state, so it
+continues to work without consulting `ws.toml` and never re-resolves a current
+default ref. A config-resolving read-only view reports each
+affected repository's configured-ref error, continues with independent
+repositories, and exits non-zero when any repository failed; it must not fall
+back to discovery for that repository.
 
 Conceptual example:
 
@@ -1131,6 +1230,13 @@ Do not require scripts/agents to parse human tables.
 Test successful `ws status --json` with a strict JSON parser and verify that
 an error produces no JSON on stdout, only a concise stderr diagnostic and a
 non-zero exit.
+
+After creation, change or remove the configuration and verify workspace-local
+status still reports the locked default selectors without re-resolving current
+configuration. For a config-resolving read-only view, make one configured ref
+unavailable and verify it reports that affected-repository error, continues
+with independent repositories, does not discover a replacement, and preserves
+the command's non-zero aggregated result.
 
 ---
 
@@ -1365,7 +1471,7 @@ At minimum implement the following.
 
 ## Multi-repo create
 
-Given repositories whose defaults are:
+Given repositories whose effective default refs are:
 
 ```text
 repo-a -> main
@@ -1421,15 +1527,33 @@ Test that:
 * canonical source paths are unique and a workspace root equal to or nested
   under either a bare or non-bare source is rejected;
 * submodules are not initialized or changed;
-* a bare source is supported, while default fallback does not use a
+* a bare source is supported, while automatic fallback does not use a
   checked-out branch and records a nullable selector;
-* default fallback uses explicit config, then one consistent remote symbolic
-  HEAD, then a non-bare checked-out branch, and rejects disagreement or
-  ambiguity without guessing;
+* global root-level `default_ref` is parsed, per-repository `default_ref`
+  overrides it, and a repository with neither value uses automatic discovery;
+* with no global `default_ref`, existing per-repository `default_ref` values
+  remain effective defaults, while configurations with neither level preserve
+  the pre-existing automatic discovery behavior;
+* global-only configuration resolves the same configured value independently
+  for every repository that lacks an override, with at least three repositories
+  demonstrating per-repository fallback;
+* fully automatic configurations (neither global nor per-repository
+  `default_ref`) preserve the existing automatic discovery behavior;
+* configured branches, tags, remote-tracking refs, full commit IDs, and
+  abbreviated commit IDs all resolve through the required commit verification;
+* an unavailable configured ref fails workspace creation for its affected
+  repository and never falls back to automatic discovery;
+* automatic multi-remote discovery is skipped when either configuration level
+  supplied `default_ref`, including when remote symbolic HEADs disagree;
+* automatic fallback uses one consistent remote symbolic HEAD, then a non-bare
+  checked-out branch, and rejects disagreement or ambiguity without guessing;
 * every repository lock records a nullable default selector independently of
   its base ref, including explicit-default, source-override, tag, and
   bare-source cases; all-explicit overrides succeed with null selectors, while
   `claim/context ... default` fails clearly only for the affected repository;
+* after creation, status reads the locked selectors without re-resolving
+  configuration; a config-resolving read-only view reports affected errors,
+  continues independent repositories, and preserves non-zero aggregation;
 * a created workspace remains operable from its lock/state after `ws.toml` is
   moved or deleted, while creation still requires config.
 * synthesized automatic targets are checked with
@@ -1471,12 +1595,17 @@ ws claim repo-a --source default
 
 must branch from B.
 
-Also create with an explicit `default_branch` and with a source override/tag,
+Also create with an explicit `default_ref` and with a source override/tag,
 delete `ws.toml`, advance the locked default selector, and verify
 workspace-local `ws claim repo-a --source default` and
 `ws context repo-a default` use the independently locked selector rather than
 the creation base. Repeat with a bare repository and an explicit default
 selector.
+
+Repeat the claim setup with a global-only `default_ref` and with a
+per-repository override over that global value. Verify the selected and locked
+selectors are the effective per-repository values, and that a source override
+or tag does not change this precedence.
 
 ## Explicit source
 
@@ -1568,7 +1697,7 @@ ws context repo-a default
 Verify:
 
 * HEAD is detached;
-* HEAD equals current default branch commit;
+* HEAD equals current effective default-ref commit;
 * original claimed branch remains intact;
 * context metadata records return branch.
 
@@ -1704,7 +1833,7 @@ Both must checkout detached commits.
 
 ## Context `default`
 
-Advance default branch after workspace creation.
+Advance the effective default ref after workspace creation.
 
 Run:
 
@@ -1712,7 +1841,12 @@ Run:
 ws context repo-a default
 ```
 
-Verify that `default` resolves the current default branch rather than the workspace's locked base.
+Verify that `default` resolves the current commit selected by the locked default
+selector rather than the workspace's locked base.
+
+Run this with a per-repository configured value, a global-only configured value,
+and a fully automatic repository. Verify each context operation uses the
+appropriate locked selector, and that a source override does not replace it.
 
 ---
 
@@ -1952,9 +2086,12 @@ Add focused unit tests where useful for:
 * deterministic tombstone path and `removal_complete` serialization;
 * context-state representation;
 * default-selector lock serialization independent of base/source refs;
+* global/per-repository `default_ref` parsing and precedence;
+* configured branch, tag, remote-tracking, full-ID, and abbreviated-ID
+  resolution, including authoritative unavailable-ref errors;
 * return-branch/saved-HEAD validation;
 * strict workspace/repository identifier and `repo=ref` parsing;
-* default-branch fallback and remote-HEAD disagreement;
+* default-ref precedence, fallback, and remote-HEAD disagreement;
 * canonical source/root safety checks;
 * atomic metadata writes and schema-version validation;
 * write-ahead transition intent/outcome and stash-token serialization;
@@ -2049,7 +2186,7 @@ ws claim app
 
 Explain explicitly that this uses the workspace's immutable locked base commit.
 
-## Claim current default branch
+## Claim current default ref
 
 ```bash
 ws claim app --source default
@@ -2105,6 +2242,12 @@ Also document:
 
 * `ws.toml`/`--config PATH` behavior and the fact that config is not searched
   upward;
+* the root-level and per-repository `default_ref` configuration, with
+  per-repository values overriding the global value and automatic discovery
+  used only when neither is configured;
+* configured default refs may be branches, tags, remote-tracking refs, or
+  full/abbreviated commit IDs, and an unavailable configured value is an
+  authoritative create error rather than a discovery fallback;
 * strict workspace and repository naming rules;
 * automatic claim branches as `ws/<workspace-name>/<repo-name>` and their
   collision/idempotency rules;
@@ -2162,6 +2305,7 @@ Implement:
 * project/package structure;
 * models;
 * `ws.toml` configuration and explicit config selection;
+* parsing and precedence for global and per-repository `default_ref` values;
 * strict identifier/source-override validation;
 * schema-versioned lock/state models and atomic metadata writes;
 * Git subprocess layer;
@@ -2177,7 +2321,10 @@ Fix all failures.
 Implement:
 
 * default source resolution;
-* exact nullable default-branch fallback order, including bare sources;
+* exact nullable default-ref precedence and fallback order, including bare sources;
+* commit-verifying configured refs, authoritative unavailable-ref failures, and
+  skipping automatic multi-remote discovery whenever configuration supplies a
+  value;
 * independent default-selector locking;
 * explicit `--source repo=ref`;
 * immutable ref resolution;
@@ -2199,6 +2346,11 @@ Implement:
 * human status;
 * JSON status;
 * dirty/branch/detached detection.
+
+Status must remain lock-based after creation and must not re-resolve current
+configuration. Any config-resolving read-only view must aggregate independent
+repository results, report affected configured-ref errors without discovery
+fallback, and retain a non-zero result when any repository is affected.
 
 Ensure successful JSON status has stdout-only JSON and failures have concise
 stderr/non-zero behavior.
@@ -2233,7 +2385,7 @@ Fix all failures.
 Implement:
 
 * `ws context <repo> <ref>`;
-* `default` context source;
+* `default` context source using the locked default selector;
 * return-state recording;
 * return-branch/saved-HEAD availability and identity checks;
 * safe automatic stash;
@@ -2286,6 +2438,8 @@ Review the complete implementation for:
 * external/internal lifecycle-lock ordering, lifetime, and manual recovery of
   both exact stale locks;
 * strict names, source parsing, default resolution, and workspace-root safety;
+* global/per-repository default-ref precedence, configured-ref validation,
+  automatic-discovery gating, and lock-based status behavior;
 * complete removal preflight and durable rerunnable progress;
 * deterministic tombstone rename/deletion and crash recovery;
 * stale worktree registrations;
@@ -2309,7 +2463,7 @@ and all configured lint/type checks.
 Do not:
 
 * assume `main`;
-* assume every repo has the same default branch;
+* assume every repo has the same default ref;
 * assume the source repository itself is clean;
 * change the source repository's checkout merely to create a workspace;
 * reset existing branches;
@@ -2497,6 +2651,14 @@ Removal completes all worktree deletion and registration verification while
 the normal workspace path exists, persists `removal_complete`, then renames
 only the metadata-only directory to the deterministic `.removing/` tombstone.
 
+### Invariant 25
+
+Workspace-local status reads the lock and state only and never re-resolves
+configuration. Config-resolving read-only views report configured-ref errors
+for affected repositories, continue independent repositories, never use
+automatic discovery as a fallback for those errors, and retain a non-zero
+aggregated result.
+
 ---
 
 # 39. Final validation
@@ -2517,7 +2679,8 @@ At completion provide:
 6. `--finalize-restore`, phase, and manual recovery semantics;
 7. `restore_conflicted` versus `restore_failed` behavior and write-ahead
    recovery records;
-8. exact default-selector lock and config-deletion semantics;
+8. exact configured/effective/auto-discovered default-ref precedence, selector lock,
+   config-deletion, and authoritative configured-ref error semantics;
 9. explanation of OID-pinned stash safety, shared-entry retention, and
    return-branch identity checks;
 10. source-root containment, removal-precedence, deterministic tombstone
