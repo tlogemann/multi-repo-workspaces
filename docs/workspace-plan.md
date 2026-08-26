@@ -197,6 +197,40 @@ An explicit source ref may determine the creation base, but does not replace
 the separately recorded default selector needed by workspace-local
 `claim/context <repo> default`.
 
+### 4b. Source availability
+
+The configured `path` entries must be valid Git repository roots at the time
+`ws create` loads the configuration. The tool does not clone or set up
+repositories.
+
+If a source repository becomes unavailable after workspace creation (deletion,
+move, network loss), workspace-local commands (`ws status`, `ws claim`,
+`ws context`, `ws remove`) treat it as an error. `ws status` reports the
+repository as unavailable. Mutation commands fail with a clear diagnostic
+referencing the repository name and the nature of the unavailability.
+Workspace removal preflights source availability before removing any worktree.
+
+**No automatic cloning.** Users are expected to clone or set up repositories
+before defining them in `ws.toml`.
+
+### 4c. Default branch resolution details
+
+The configured `default_branch` value, when present, is resolved as a Git ref
+in the source repository at workspace creation time. It is stored as-is in the
+lock file's `default_selector`. It is not required to be a branch name; any
+resolvable Git ref (branch, tag, remote-tracking ref, abbreviated SHA) is
+acceptable, provided `git rev-parse --verify <value>^{commit}` succeeds in the
+source repository.
+
+For multi-remote repositories, `_remote_symbolic_selector` considers **all**
+`refs/remotes/*/HEAD` entries. If exactly one distinct commit is reachable from
+all remote symbolic HEAD targets, the alphabetically smallest target branch name
+is selected (for determinism). If different commits are reachable, the tool
+errors with "remote symbolic HEADs disagree" rather than picking one. This means
+a repository with only an `origin` remote behaves predictably; a repository with
+multiple remotes that point to different default branches also fails predictably
+rather than silently picking one.
+
 ---
 
 # 5. Workspace creation
