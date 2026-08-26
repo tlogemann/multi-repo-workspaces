@@ -271,16 +271,8 @@ def claim_workspace(
 ) -> None:
     validate_logical_name(repository_name, kind="repository")
     paths = discover_workspace()
-    lifecycle_acquired = False
     operation_acquired = False
     try:
-        try:
-            paths.lifecycle_lock.mkdir()
-            lifecycle_acquired = True
-        except FileExistsError as exc:
-            raise WsError(
-                f"workspace lifecycle lock already exists: {paths.lifecycle_lock}"
-            ) from exc
         try:
             paths.operation_lock.mkdir()
             operation_acquired = True
@@ -338,8 +330,6 @@ def claim_workspace(
     finally:
         if operation_acquired:
             _release_operation_lock(paths.operation_lock)
-        if lifecycle_acquired:
-            _release_lifecycle_lock(paths.lifecycle_lock)
 
 
 def remove_workspace(
@@ -1206,7 +1196,7 @@ def enter_context(repository_name: str, target_ref: str) -> str | None:
     if not target_ref:
         raise WsError("context requires a non-empty ref")
     paths = discover_workspace()
-    lifecycle_acquired, operation_acquired = _acquire_mutator_locks(paths)
+    operation_acquired = _acquire_operation_lock(paths)
     try:
         lock, state = _read_metadata(paths)
         _validate_discovered_workspace_name(paths, lock)
@@ -1383,14 +1373,12 @@ def enter_context(repository_name: str, target_ref: str) -> str | None:
     finally:
         if operation_acquired:
             _release_operation_lock(paths.operation_lock)
-        if lifecycle_acquired:
-            _release_lifecycle_lock(paths.lifecycle_lock)
 
 
 def restore_context(repository_name: str) -> str | None:
     validate_logical_name(repository_name, kind="repository")
     paths = discover_workspace()
-    lifecycle_acquired, operation_acquired = _acquire_mutator_locks(paths)
+    operation_acquired = _acquire_operation_lock(paths)
     try:
         lock, state = _read_metadata(paths)
         _validate_discovered_workspace_name(paths, lock)
@@ -1588,14 +1576,12 @@ def restore_context(repository_name: str) -> str | None:
     finally:
         if operation_acquired:
             _release_operation_lock(paths.operation_lock)
-        if lifecycle_acquired:
-            _release_lifecycle_lock(paths.lifecycle_lock)
 
 
 def finalize_restore(repository_name: str) -> str | None:
     validate_logical_name(repository_name, kind="repository")
     paths = discover_workspace()
-    lifecycle_acquired, operation_acquired = _acquire_mutator_locks(paths)
+    operation_acquired = _acquire_operation_lock(paths)
     try:
         lock, state = _read_metadata(paths)
         _validate_discovered_workspace_name(paths, lock)
@@ -1658,21 +1644,14 @@ def finalize_restore(repository_name: str) -> str | None:
     finally:
         if operation_acquired:
             _release_operation_lock(paths.operation_lock)
-        if lifecycle_acquired:
-            _release_lifecycle_lock(paths.lifecycle_lock)
 
 
-def _acquire_mutator_locks(paths: WorkspacePaths) -> tuple[bool, bool]:
-    try:
-        paths.lifecycle_lock.mkdir()
-    except FileExistsError as exc:
-        raise WsError(f"workspace lifecycle lock already exists: {paths.lifecycle_lock}") from exc
+def _acquire_operation_lock(paths: WorkspacePaths) -> bool:
     try:
         paths.operation_lock.mkdir()
     except FileExistsError as exc:
-        _release_lifecycle_lock(paths.lifecycle_lock)
         raise WsError(f"workspace operation lock already exists: {paths.operation_lock}") from exc
-    return True, True
+    return True
 
 
 def _locked_repo(lock: WorkspaceLock, repository_name: str) -> WorkspaceLockRepo:
@@ -1927,17 +1906,31 @@ def status_workspace(start: Path | None = None) -> dict[str, Any]:
 def render_status_human(payload: dict[str, Any]) -> str:
     lines = [f"WORKSPACE {payload['workspace']}", ""]
     lines.append(
-        "repo       base             HEAD        mode      branch              dirty  context"
+        "repo       base             default          HEAD      mode      branch              dirty  context"
     )
-    lines.append("-" * 88)
+    lines.append("-" * 100)
     for name, repo in payload["repos"].items():
         head = str(repo["head"])[:12]
         branch = repo["branch"] or "-"
-        context = "-" if repo["context"] is None else repo["context"]["target_ref"]
+        default = repo["locked_default_selector"] or "-"
+        if repo["context"] is None:
+            context = "-"
+        else:
+            context = repo["context"]["target_ref"]
+            if repo["context"]["phase"] not in (None, "inactive", "none"):
+                context = f"{context} ({repo['context']['phase']})"
         lines.append(
-            f"{name:<10} {str(repo['locked_base_ref']):<16} {head:<11} "
+            f"{name:<10} {str(repo['locked_base_ref']):<16} {default:<17} {head:<11} "
             f"{repo['mode']:<9} {branch:<19} "
             f"{'yes' if repo['dirty'] else 'no':<6} {context}"
+        )
+    removal = payload.get("removal")
+    if removal is not None:
+        completed = len(removal["completed"])
+        total = len(payload["repos"])
+        lines.append("")
+        lines.append(
+            f"REMOVAL {removal['phase']} ({completed}/{total} repos removed)"
         )
     return "\n".join(lines)
 
