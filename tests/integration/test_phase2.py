@@ -40,8 +40,8 @@ def write_config(path: Path, workspace_root: str, repos: str) -> Path:
     return path
 
 
-def repo_table(name: str, source: Path, default_branch: str | None = None) -> str:
-    default = "" if default_branch is None else f'\ndefault_branch = "{default_branch}"'
+def repo_table(name: str, source: Path, default_ref: str | None = None) -> str:
+    default = "" if default_ref is None else f'\ndefault_ref = "{default_ref}"'
     return f'[repos."{name}"]\npath = "{source}"{default}\n'
 
 

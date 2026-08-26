@@ -34,8 +34,8 @@ def write_config(path: Path, workspace_root: str, repos: str) -> Path:
     return path
 
 
-def repo_table(name: str, source: Path, default_branch: str | None = None) -> str:
-    default = "" if default_branch is None else f'\ndefault_branch = "{default_branch}"'
+def repo_table(name: str, source: Path, default_ref: str | None = None) -> str:
+    default = "" if default_ref is None else f'\ndefault_ref = "{default_ref}"'
     return f'[repos."{name}"]\npath = {json.dumps(str(source))}{default}\n'
 
 
@@ -44,13 +44,13 @@ def git_output(cwd: Path, *args: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-def create_config(tmp_path: Path, source: Path, *, default_branch: str | None = None) -> Path:
+def create_config(tmp_path: Path, source: Path, *, default_ref: str | None = None) -> Path:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     return write_config(
         config_dir / "ws.toml",
         "../workspaces",
-        repo_table("app", source, default_branch),
+        repo_table("app", source, default_ref),
     )
 
 
@@ -65,7 +65,7 @@ def test_claim_uses_locked_base_but_source_default_uses_current_default(
 ) -> None:
     source = git_repo("claim-defaults")
     initial = source.run("rev-parse", "HEAD").stdout.strip()
-    config = create_config(tmp_path, source.path, default_branch="main")
+    config = create_config(tmp_path, source.path, default_ref="main")
     locked = create_workspace(tmp_path, source.path, "locked", config)
     current = create_workspace(tmp_path, source.path, "current", config)
     latest = source.commit("advanced", content="advanced\n")
@@ -226,7 +226,7 @@ def test_claim_default_uses_locked_selector_after_config_and_tag_source_are_remo
 ) -> None:
     source = git_repo("claim-locked-selector")
     source.run("tag", "v1")
-    config = create_config(tmp_path, source.path, default_branch="main")
+    config = create_config(tmp_path, source.path, default_ref="main")
     workspace = tmp_path / "workspaces" / "tagged"
     created = run_ws(
         config.parent,
@@ -269,7 +269,7 @@ def test_claim_default_uses_explicit_locked_selector_for_bare_source_after_confi
     seed.run("remote", "add", "origin", str(bare))
     seed.run("push", "origin", "main")
     seed.run("--git-dir", str(bare), "symbolic-ref", "HEAD", "refs/heads/main")
-    config = create_config(tmp_path, bare, default_branch="main")
+    config = create_config(tmp_path, bare, default_ref="main")
     workspace = create_workspace(tmp_path, bare, "bare-default", config)
     initial = git_output(workspace / "repos" / "app", "rev-parse", "HEAD")
     config.unlink()

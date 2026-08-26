@@ -16,8 +16,8 @@ def write_config(path: Path, *, workspace_root: str, repos: str) -> Path:
     return path
 
 
-def repo_table(name: str, path: Path, default_branch: str | None = None) -> str:
-    default = "" if default_branch is None else f'\ndefault_branch = "{default_branch}"'
+def repo_table(name: str, path: Path, default_ref: str | None = None) -> str:
+    default = "" if default_ref is None else f'\ndefault_ref = "{default_ref}"'
     return f'[repos."{name}"]\npath = "{path}"{default}\n'
 
 
@@ -36,7 +36,7 @@ def test_loads_relative_paths_and_canonicalizes_sources(tmp_path: Path, git_repo
     assert config.path == config_path.resolve()
     assert config.workspace_root == (config_dir / "../workspaces").resolve()
     assert config.repos["app"].source_path == source.path.resolve()
-    assert config.repos["app"].default_branch is None
+    assert config.repos["app"].default_ref is None
 
 
 def test_preserves_optional_default_branch(tmp_path: Path, git_repo) -> None:
@@ -47,7 +47,7 @@ def test_preserves_optional_default_branch(tmp_path: Path, git_repo) -> None:
         repos=repo_table("app", source.path, "develop"),
     )
 
-    assert load_config(config_path).repos["app"].default_branch == "develop"
+    assert load_config(config_path).repos["app"].default_ref == "develop"
 
 
 @pytest.mark.parametrize("name", ["", ".", "..", "-app", "a/b", "a\\b", "a\n"])
@@ -106,7 +106,7 @@ def test_rejects_missing_config_and_does_not_search_upward(tmp_path: Path) -> No
         load_config(tmp_path / "nested" / "ws.toml")
 
 
-def test_rejects_empty_default_branch(tmp_path: Path, git_repo) -> None:
+def test_rejects_empty_default_ref(tmp_path: Path, git_repo) -> None:
     source = git_repo("source")
     config_path = write_config(
         tmp_path / "ws.toml",
@@ -114,7 +114,7 @@ def test_rejects_empty_default_branch(tmp_path: Path, git_repo) -> None:
         repos=repo_table("app", source.path, ""),
     )
 
-    with pytest.raises(ConfigError, match="default_branch"):
+    with pytest.raises(ConfigError, match="default_ref"):
         load_config(config_path)
 
 
@@ -145,3 +145,63 @@ def test_rejects_duplicate_source_overrides() -> None:
 def test_rejects_unknown_source_override_repository() -> None:
     with pytest.raises(ConfigError, match="unknown repository"):
         parse_source_overrides(["tools=main"], ["app"])
+
+
+def test_loads_global_default_ref(tmp_path: Path, git_repo) -> None:
+    source = git_repo("source")
+    config_path = write_config(
+        tmp_path / "ws.toml",
+        workspace_root='"workspaces"',
+        repos=repo_table("app", source.path),
+    )
+    # Prepend global default_ref to the config
+    config_path.write_text(
+        'default_ref = "main"\n\n[project]\nworkspace_root = "workspaces"\n\n[repos."app"]\npath = "'
+        + str(source.path)
+        + '"',
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.default_ref == "main"
+    assert config.repos["app"].default_ref is None
+
+
+def test_per_repo_default_ref_overrides_global(tmp_path: Path, git_repo) -> None:
+    source = git_repo("source")
+    config_path = write_config(
+        tmp_path / "ws.toml",
+        workspace_root='"workspaces"',
+        repos=repo_table("app", source.path),
+    )
+    # Prepend global default_ref with per-repo override
+    config_path.write_text(
+        'default_ref = "main"\n\n[project]\nworkspace_root = "workspaces"\n\n[repos."app"]\npath = "'
+        + str(source.path)
+        + '"\ndefault_ref = "develop"',
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.default_ref == "main"
+    assert config.repos["app"].default_ref == "develop"
+
+
+def test_rejects_empty_global_default_ref(tmp_path: Path, git_repo) -> None:
+    source = git_repo("source")
+    config_path = write_config(
+        tmp_path / "ws.toml",
+        workspace_root='"workspaces"',
+        repos=repo_table("app", source.path),
+    )
+    config_path.write_text(
+        'default_ref = ""\n\n[project]\nworkspace_root = "workspaces"\n\n[repos."app"]\npath = "'
+        + str(source.path)
+        + '"',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="default_ref"):
+        load_config(config_path)

@@ -64,6 +64,9 @@ def load_config(path: str | Path) -> ProjectConfig:
     except OSError as exc:
         raise ConfigError(f"cannot read configuration file {config_path}: {exc}") from exc
 
+    # Parse global default_ref if present
+    global_default_ref = _validate_default_ref(raw.get("default_ref"), "default_ref")
+
     project = _mapping(raw.get("project"), "[project]")
     workspace_root_value = project.get("workspace_root")
     if not isinstance(workspace_root_value, str) or not workspace_root_value:
@@ -96,14 +99,8 @@ def load_config(path: str | Path) -> ProjectConfig:
             )
         canonical_sources[source_path] = name
 
-        default_branch = repo.get("default_branch")
-        if default_branch is not None and (
-            not isinstance(default_branch, str)
-            or not default_branch
-            or any(ord(char) < 32 or ord(char) == 127 for char in default_branch)
-        ):
-            raise ConfigError(f"[repos.{name}].default_branch must be a non-empty ref string")
-        repos[name] = RepoConfig(name, source_path, default_branch)
+        default_ref = _validate_default_ref(repo.get("default_ref"), f"[repos.{name}].default_ref")
+        repos[name] = RepoConfig(name, source_path, default_ref)
 
     for source_path in canonical_sources:
         if workspace_root == source_path or source_path in workspace_root.parents:
@@ -112,10 +109,18 @@ def load_config(path: str | Path) -> ProjectConfig:
                 f"source repository {source_path}"
             )
 
-    return ProjectConfig(config_path, workspace_root, repos)
+    return ProjectConfig(config_path, workspace_root, global_default_ref, repos)
 
 
 def _mapping(value: Any, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{label} must be a TOML table")
+    return value
+
+
+def _validate_default_ref(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or any(ord(c) < 32 or c == "\x7f" for c in value):
+        raise ConfigError(f"{label} must be a non-empty ref string")
     return value

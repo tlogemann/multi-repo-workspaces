@@ -18,13 +18,14 @@ WORKSPACE_PHASES = frozenset({"idle"}) | REMOVAL_PHASES
 class RepoConfig:
     name: str
     source_path: Path
-    default_branch: str | None = None
+    default_ref: str | None = None
 
 
 @dataclass(frozen=True)
 class ProjectConfig:
     path: Path
     workspace_root: Path
+    default_ref: str | None
     repos: dict[str, RepoConfig]
 
 

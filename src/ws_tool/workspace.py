@@ -120,7 +120,7 @@ def create_workspace(
         if paths.tombstone.exists() or paths.tombstone.is_symlink():
             raise WsError(f"workspace removal tombstone already exists: {paths.tombstone}")
 
-        plans = _resolve_creation_plans(project.repos, overrides)
+        plans = _resolve_creation_plans(project.repos, overrides, project.default_ref)
         paths.workspace.mkdir()
         workspace_created = True
         repos_root = paths.workspace / "repos"
@@ -1963,13 +1963,15 @@ def _paths(root: Path, name: str) -> WorkspacePaths:
 
 
 def _resolve_creation_plans(
-    repos: dict[str, Any], overrides: dict[str, str]
+    repos: dict[str, Any], overrides: dict[str, str], global_default_ref: str | None
 ) -> list[_CreationPlan]:
     plans: list[_CreationPlan] = []
     for name, repo in repos.items():
         override = overrides.get(name)
         try:
-            selector = _default_selector(repo.source_path, repo.default_branch)
+            selector = _effective_default_selector(
+                repo.source_path, repo.default_ref, global_default_ref
+            )
             if selector is not None:
                 _resolve_commit(repo.source_path, selector)
         except ConfigError:
@@ -1990,9 +1992,35 @@ def _resolve_creation_plans(
     return plans
 
 
-def _default_selector(source: Path, configured: str | None) -> str | None:
-    if configured is not None:
-        return configured
+def _effective_default_selector(
+    source: Path, repo_default: str | None, global_default: str | None
+) -> str | None:
+    """Resolve the effective default selector using hierarchical precedence.
+
+    Precedence:
+    1. Per-repository default_ref if configured
+    2. Global default_ref if configured
+    3. Automatic discovery (remote symbolic HEAD or checked-out branch)
+
+    Automatic discovery is skipped when either configuration level supplied
+    a default_ref.
+    """
+    # Precedence 1: per-repository default_ref
+    if repo_default is not None:
+        return repo_default
+    # Precedence 2: global default_ref
+    if global_default is not None:
+        return global_default
+    # Precedence 3: automatic discovery (only when neither config level supplied default_ref)
+    return _auto_default_selector(source)
+
+
+def _auto_default_selector(source: Path) -> str | None:
+    """Automatically discover a default selector from the source repository.
+
+    Uses remote symbolic HEAD if unambiguous, otherwise falls back to the
+    currently checked-out branch of a non-bare repository.
+    """
     remote_selector = _remote_symbolic_selector(source)
     if remote_selector is not None:
         return remote_selector

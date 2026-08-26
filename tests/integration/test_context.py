@@ -37,8 +37,8 @@ def git_output(cwd: Path, *args: str, check: bool = True) -> str:
     return git(cwd, *args, check=check).stdout.strip()
 
 
-def write_config(path: Path, source: Path, *, default_branch: str | None = None) -> Path:
-    configured = "" if default_branch is None else f'\ndefault_branch = "{default_branch}"'
+def write_config(path: Path, source: Path, *, default_ref: str | None = None) -> Path:
+    configured = "" if default_ref is None else f'\ndefault_ref = "{default_ref}"'
     path.write_text(
         '[project]\nworkspace_root = "../workspaces"\n\n'
         f'[repos."app"]\npath = {json.dumps(str(source))}{configured}\n',
@@ -58,11 +58,11 @@ def write_two_repo_config(path: Path, app_source: Path, api_source: Path) -> Pat
 
 
 def create_workspace(
-    tmp_path: Path, source: Path, name: str, *, default_branch: str | None = None
+    tmp_path: Path, source: Path, name: str, *, default_ref: str | None = None
 ) -> Path:
     config_dir = tmp_path / f"config-{name}"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", source, default_branch=default_branch)
+    config = write_config(config_dir / "ws.toml", source, default_ref=default_ref)
     result = run_ws(config_dir, "create", name, "--config", str(config))
     assert result.returncode == 0, result.stderr
     return tmp_path / "workspaces" / name
@@ -113,7 +113,7 @@ def test_clean_claimed_context_uses_locked_default_and_restores_branch(
     source = git_repo("context-clean-claimed")
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", source.path, default_branch="main")
+    config = write_config(config_dir / "ws.toml", source.path, default_ref="main")
     result = run_ws(config_dir, "create", "clean", "--config", str(config))
     assert result.returncode == 0, result.stderr
     workspace = tmp_path / "workspaces" / "clean"
@@ -210,7 +210,7 @@ def test_dirty_claimed_context_preserves_changes_and_unrelated_newer_stash(
     tmp_path: Path, git_repo
 ) -> None:
     source = git_repo("context-dirty-claimed")
-    workspace = create_workspace(tmp_path, source.path, "dirty", default_branch="main")
+    workspace = create_workspace(tmp_path, source.path, "dirty", default_ref="main")
     worktree = workspace / "repos" / "app"
     assert run_ws(worktree, "claim", "app", "--target", "feature/dirty").returncode == 0
     (worktree / "tracked.txt").write_text("base\n", encoding="utf-8")
