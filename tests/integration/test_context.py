@@ -306,8 +306,9 @@ def test_context_return_checkout_failure_persists_return_head_without_recovery(
     intent, failure = effect_pair(context, "return_checkout")
     assert context.phase == "restoring"
     assert context.return_saved_head == saved_head
+    assert intent.expected_refs["HEAD"] == saved_head
+    assert intent.known_oids["return"] == saved_head
     assert failure.known_oids["return"] == saved_head
-    assert intent.known_oids == {}
 
 
 def test_context_stash_apply_failure_records_pinned_oid_and_partial_dirty_state(

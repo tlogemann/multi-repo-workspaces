@@ -226,8 +226,8 @@ def test_remove_partial_later_failure_persists_progress_and_retries_only_remaini
     assert (workspace / "repos" / "library").exists()
     assert app.path.is_dir()
     assert library.path.is_dir()
-    (workspace / ".ws" / "operation.lock").rmdir()
-    (workspace.parent / ".partial.lifecycle.lock").rmdir()
+    assert not (workspace / ".ws" / "operation.lock").exists()
+    assert not (workspace.parent / ".partial.lifecycle.lock").exists()
 
     retried = run_ws(config_dir, "remove", "partial", "--config", str(config))
 
@@ -326,10 +326,10 @@ def test_remove_tombstone_cleanup_interrupt_retains_parseable_state_and_locks(
     source = git_repo("remove-tombstone-crash")
     workspace, config = create_workspace(tmp_path, source.path, "tombstone-crash")
     original_rmtree = workspace_module.shutil.rmtree
-    disposable = workspace.parent / ".tombstone-crash.removing.deleting"
+    tombstone = workspace.parent / ".tombstone-crash.removing"
 
     def interrupt_cleanup(path):
-        assert path.parent == disposable
+        assert path == tombstone
         original_rmtree(path)
         raise KeyboardInterrupt
 
@@ -338,17 +338,18 @@ def test_remove_tombstone_cleanup_interrupt_retains_parseable_state_and_locks(
     with pytest.raises(KeyboardInterrupt):
         workspace_module.remove_workspace("tombstone-crash", config_path=config)
 
-    tombstone = workspace.parent / ".tombstone-crash.removing"
-    state_path = disposable / ".ws" / "state.toml"
+    state_path = tombstone / ".ws" / "state.toml"
     state = deserialize_workspace_state(state_path.read_text(encoding="utf-8"))
     assert state.phase == "removal_complete"
-    assert not tombstone.exists()
-    assert disposable.is_dir()
+    assert tombstone.is_dir()
     lifecycle_lock = workspace.parent / ".tombstone-crash.lifecycle.lock"
-    operation_lock = disposable / ".ws" / "operation.lock"
+    operation_lock = tombstone / ".ws" / "operation.lock"
     assert lifecycle_lock.is_dir()
     assert operation_lock.is_dir()
     assert not workspace.exists()
+    status = run_ws(tombstone, "status", "--json")
+    assert status.returncode == 0, status.stderr
+    assert json.loads(status.stdout)["removal"]["phase"] == "removal_complete"
 
     operation_lock.rmdir()
     lifecycle_lock.rmdir()

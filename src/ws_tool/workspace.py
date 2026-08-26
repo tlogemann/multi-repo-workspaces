@@ -329,10 +329,8 @@ def remove_workspace(
     lifecycle_acquired = False
     operation_acquired = False
     location: WorkspacePaths | None = None
-    retain_lifecycle_lock = False
     retain_locks = False
-    deletion_attempted = False
-    cleanup_attempted = False
+    removal_uncertain = False
     try:
         try:
             base_paths.lifecycle_lock.mkdir()
@@ -343,27 +341,13 @@ def remove_workspace(
             ) from exc
 
         location = _existing_removal_paths(base_paths)
-        if location.workspace != _disposable_paths(base_paths).workspace:
-            try:
-                location.operation_lock.mkdir()
-                operation_acquired = True
-            except FileExistsError as exc:
-                raise WsError(
-                    f"workspace operation lock already exists: {location.operation_lock}"
-                ) from exc
-        elif location.operation_lock.parent.exists():
-            try:
-                location.operation_lock.mkdir()
-                operation_acquired = True
-            except FileExistsError as exc:
-                raise WsError(
-                    f"workspace operation lock already exists: {location.operation_lock}"
-                ) from exc
-
-        if location.workspace == _disposable_paths(base_paths).workspace:
-            cleanup_attempted = True
-            _delete_disposable_tombstone(location)
-            return
+        try:
+            location.operation_lock.mkdir()
+            operation_acquired = True
+        except FileExistsError as exc:
+            raise WsError(
+                f"workspace operation lock already exists: {location.operation_lock}"
+            ) from exc
 
         lock, state = _read_metadata(location)
         resuming_removal = state.removal is not None
@@ -391,7 +375,6 @@ def remove_workspace(
                 if removal.phase != "removal_complete":
                     raise WsError("removal tombstone has an incomplete removal phase")
                 _verify_removal_complete(lock, removal)
-                cleanup_attempted = True
                 _delete_removal_tombstone(location)
                 return
             if removal.phase not in REMOVAL_PHASES:
@@ -412,13 +395,20 @@ def remove_workspace(
             if record.complete:
                 _verify_removed_record(lock, repository_name, record)
                 continue
-            deletion_attempted = True
-            _remove_expected_worktree(
-                lock,
-                repository_name,
-                record,
-                allow_absent=resuming_removal,
-            )
+            try:
+                _remove_expected_worktree(
+                    lock,
+                    repository_name,
+                    record,
+                    allow_absent=resuming_removal,
+                )
+            except KeyboardInterrupt:
+                removal_uncertain = True
+                raise
+            except BaseException:
+                if _removal_is_uncertain(lock, repository_name, record):
+                    removal_uncertain = True
+                raise
             current_removal = replace(
                 current_removal,
                 repos={
@@ -433,27 +423,15 @@ def remove_workspace(
         state = replace(state, phase="removal_complete", removal=current_removal)
         write_workspace_state(location.state, state)
         _rename_to_removal_tombstone(location, base_paths.tombstone)
-        try:
-            cleanup_attempted = True
-            _delete_removal_tombstone(_tombstone_paths(base_paths))
-        except Exception as exc:
-            retain_lifecycle_lock = True
-            raise WsError(
-                f"removal completed but tombstone cleanup failed; manually recover "
-                f"{base_paths.tombstone}: {exc}"
-            ) from exc
+        _delete_removal_tombstone(_tombstone_paths(base_paths))
     except BaseException as exc:
-        if isinstance(exc, KeyboardInterrupt) or deletion_attempted or cleanup_attempted:
+        if isinstance(exc, KeyboardInterrupt) or removal_uncertain:
             retain_locks = True
         raise
     finally:
-        if (
-            operation_acquired
-            and location is not None
-            and not (retain_lifecycle_lock or retain_locks)
-        ):
+        if operation_acquired and location is not None and not retain_locks:
             _release_operation_lock(location.operation_lock)
-        if lifecycle_acquired and not (retain_lifecycle_lock or retain_locks):
+        if lifecycle_acquired and not retain_locks:
             _release_lifecycle_lock(base_paths.lifecycle_lock)
 
 
@@ -482,8 +460,8 @@ def _resolve_removal_paths(
     return _paths(project.workspace_root, workspace_name)
 
 
-def _discover_removal_paths() -> WorkspacePaths | None:
-    current = Path.cwd().expanduser().resolve()
+def _discover_removal_paths(start: Path | None = None) -> WorkspacePaths | None:
+    current = (Path.cwd() if start is None else start).expanduser().resolve()
     for candidate in (current, *current.parents):
         if not (candidate / ".ws").is_dir():
             continue
@@ -498,19 +476,15 @@ def _discover_removal_paths() -> WorkspacePaths | None:
 def _existing_removal_paths(base: WorkspacePaths) -> WorkspacePaths:
     normal = base.workspace.exists()
     tombstone = base.tombstone.exists() or base.tombstone.is_symlink()
-    disposable = _disposable_paths(base).workspace
-    disposable_exists = disposable.exists() or disposable.is_symlink()
-    if sum((normal, tombstone, disposable_exists)) > 1:
+    if normal and tombstone:
         raise WsError(
-            "multiple workspace removal paths exist; manual recovery required: "
-            f"{base.workspace}, {base.tombstone}, {disposable}"
+            f"both workspace and removal tombstone exist; manual recovery required: "
+            f"{base.workspace}, {base.tombstone}"
         )
     if normal:
         return base
     if tombstone:
         return _tombstone_paths(base)
-    if disposable_exists:
-        return _disposable_paths(base)
     raise WsError(f"workspace does not exist: {base.workspace}")
 
 
@@ -522,17 +496,6 @@ def _tombstone_paths(base: WorkspacePaths) -> WorkspacePaths:
         lock=tombstone / "workspace.lock.toml",
         state=tombstone / ".ws" / "state.toml",
         operation_lock=tombstone / ".ws" / "operation.lock",
-    )
-
-
-def _disposable_paths(base: WorkspacePaths) -> WorkspacePaths:
-    disposable = base.tombstone.with_name(f"{base.tombstone.name}.deleting")
-    return replace(
-        base,
-        workspace=disposable,
-        lock=disposable / "workspace.lock.toml",
-        state=disposable / ".ws" / "state.toml",
-        operation_lock=disposable / ".ws" / "operation.lock",
     )
 
 
@@ -653,6 +616,29 @@ def _verify_removed_record(
         )
 
 
+def _removal_is_uncertain(
+    lock: WorkspaceLock,
+    repository_name: str,
+    record: RemovalRepoState,
+) -> bool:
+    worktree = record.worktree_path
+    if not worktree.exists():
+        return True
+    try:
+        identity = validate_worktree_registration(
+            lock.repos[repository_name].source_path,
+            worktree,
+        )
+        validate_removal_repo_identity(
+            record,
+            worktree_path=worktree,
+            git_admin_path=identity.git_admin_path,
+        )
+    except (GitWorktreeError, SerializationError, WsError):
+        return True
+    return False
+
+
 def _remove_expected_worktree(
     lock: WorkspaceLock,
     repository_name: str,
@@ -715,18 +701,14 @@ def _delete_removal_tombstone(paths: WorkspacePaths) -> None:
         raise WsError(f"removal operation lock is not an empty directory: {paths.operation_lock}")
     lock_text = paths.lock.read_text(encoding="utf-8")
     state_text = paths.state.read_text(encoding="utf-8")
-    disposable = _disposable_paths(paths)
-    if disposable.workspace.exists() or disposable.workspace.is_symlink():
-        raise WsError(f"removal disposable path already exists: {disposable.workspace}")
-    paths.workspace.rename(disposable.workspace)
     try:
-        # The authoritative tombstone is atomically moved out of the recovery
-        # name before deletion.  If deletion is interrupted, the deterministic
-        # disposable path remains the only recovery candidate.
-        _delete_disposable_tombstone(disposable)
+        # Keep the authoritative lock/state intact until the final recursive
+        # cleanup.  If cleanup is interrupted, reconstruct the exact
+        # deterministic tombstone before propagating the interruption.
+        shutil.rmtree(paths.workspace)
     except BaseException as exc:
         try:
-            _restore_interrupted_tombstone(disposable, lock_text, state_text)
+            _restore_interrupted_tombstone(paths, lock_text, state_text)
         except BaseException as restore_error:
             exc.add_note(f"could not reconstruct removal tombstone: {restore_error}")
         raise
@@ -751,19 +733,6 @@ def _restore_interrupted_tombstone(
             raise WsError(f"cannot reconstruct removal operation lock: {paths.operation_lock}")
     else:
         paths.operation_lock.mkdir()
-
-
-def _delete_disposable_tombstone(paths: WorkspacePaths) -> None:
-    if not paths.workspace.exists():
-        return
-    if not paths.workspace.is_dir() or paths.workspace.is_symlink():
-        raise WsError(f"removal disposable path is not a directory: {paths.workspace}")
-    for entry in paths.workspace.iterdir():
-        if entry.is_dir() and not entry.is_symlink():
-            shutil.rmtree(entry)
-        else:
-            entry.unlink()
-    paths.workspace.rmdir()
 
 
 def _claim_source_commit(locked: WorkspaceLockRepo, source: str | None) -> str:
@@ -1049,15 +1018,17 @@ def restore_context(repository_name: str) -> str | None:
             dirty=False,
         )
         write_workspace_state(paths.state, restoring)
+        return_head = context.return_saved_head
+        assert return_head is not None
         current = _context_effect_intent(
             paths,
             restoring,
             repository_name,
             "return_checkout",
             "intent",
+            expected_refs={"HEAD": return_head},
+            known_oids={"return": return_head},
         )
-        return_head = context.return_saved_head
-        assert return_head is not None
         try:
             if context.return_mode == "claimed":
                 assert context.return_branch is not None
@@ -1499,12 +1470,16 @@ def _has_unmerged_entries(worktree: Path) -> bool:
 
 
 def status_workspace(start: Path | None = None) -> dict[str, Any]:
-    paths = discover_workspace(start)
+    base_paths = _discover_removal_paths(start)
+    if base_paths is None:
+        current = (Path.cwd() if start is None else start).expanduser().resolve()
+        raise WsError(f"no workspace found above {current}")
+    paths = _existing_removal_paths(base_paths)
     lock, state = _read_metadata(paths)
-    if lock.workspace_name != paths.workspace.name:
+    if lock.workspace_name != base_paths.workspace.name:
         raise WsError(
             f"workspace name in lock {lock.workspace_name!r} does not match directory "
-            f"{paths.workspace.name!r}"
+            f"{base_paths.workspace.name!r}"
         )
     repos: dict[str, Any] = {}
     for name, locked in lock.repos.items():
