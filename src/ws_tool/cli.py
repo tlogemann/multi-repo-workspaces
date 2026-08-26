@@ -6,7 +6,15 @@ import sys
 from collections.abc import Sequence
 
 from .errors import WsError
-from .workspace import claim_workspace, create_workspace, render_status_human, status_workspace
+from .workspace import (
+    claim_workspace,
+    create_workspace,
+    enter_context,
+    finalize_restore,
+    render_status_human,
+    restore_context,
+    status_workspace,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -74,6 +82,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "claim":
             claim_workspace(args.repo, source=args.source, target=args.target)
             print(f"Claimed repository {args.repo}")
+            return 0
+        if args.command == "context":
+            if args.restore:
+                message = restore_context(args.repo)
+            elif args.finalize_restore:
+                message = finalize_restore(args.repo)
+            elif args.ref is None:
+                raise WsError("context requires a ref, --restore, or --finalize-restore")
+            else:
+                message = enter_context(args.repo, args.ref)
+            print(message or f"Context operation completed for {args.repo}")
             return 0
         print(f"ws {args.command} is not implemented in Phase 2A", file=sys.stderr)
         return 2

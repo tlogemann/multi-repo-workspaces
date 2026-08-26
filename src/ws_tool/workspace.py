@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from .config import load_config, parse_source_overrides
 from .errors import ConfigError, GitWorktreeError, SerializationError, WsError
-from .git import repository_kind, run_git, validate_worktree_registration
+from .git import (
+    create_private_ref,
+    delete_private_ref,
+    list_worktrees,
+    repository_kind,
+    run_git,
+    validate_worktree_registration,
+)
 from .models import (
     CONTEXT_PHASES,
     REMOVAL_PHASES,
+    ContextSideEffect,
+    ContextState,
     RepoState,
     WorkspaceLock,
     WorkspaceLockRepo,
@@ -351,6 +361,690 @@ def _validate_discovered_workspace_name(paths: WorkspacePaths, lock: WorkspaceLo
             f"workspace name in lock {lock.workspace_name!r} does not match directory "
             f"{paths.workspace.name!r}"
         )
+
+
+def enter_context(repository_name: str, target_ref: str) -> str | None:
+    validate_logical_name(repository_name, kind="repository")
+    if not target_ref:
+        raise WsError("context requires a non-empty ref")
+    paths = discover_workspace()
+    lifecycle_acquired, operation_acquired = _acquire_mutator_locks(paths)
+    try:
+        lock, state = _read_metadata(paths)
+        _validate_discovered_workspace_name(paths, lock)
+        _reject_context_mutation_during_removal(state)
+        if state.phase in {"entering", "restoring"}:
+            raise WsError(
+                f"workspace has an interrupted context transition ({state.phase}); "
+                "manual recovery is required"
+            )
+        if state.phase in {"restore_conflicted", "restore_failed"}:
+            raise WsError(
+                f"workspace has an unresolved context transition ({state.phase}); "
+                "restore it before entering another context"
+            )
+        locked = _locked_repo(lock, repository_name)
+        saved = state.repos[repository_name]
+        if saved.context is not None or saved.mode == "context":
+            raise WsError(
+                f"repository {repository_name!r} already has an active temporary context; "
+                f"restore it first with: ws context {repository_name} --restore"
+            )
+        worktree = paths.workspace / "repos" / repository_name
+        validate_worktree_registration(locked.source_path, worktree)
+        live = _read_live_repo(worktree)
+        target_commit = _context_target_commit(locked, target_ref)
+        token = uuid.uuid4().hex
+        private_ref = f"refs/ws/context/{lock.workspace_name}/{repository_name}/{token}"
+        context = ContextState(
+            target_ref=target_ref,
+            target_commit=target_commit,
+            phase="entering",
+            return_mode=live["mode"],
+            stash_token=token,
+            return_branch=live["branch"],
+            return_saved_head=live["head"],
+            private_ref=private_ref if live["dirty"] else None,
+        )
+        entering = _set_context_state(
+            state,
+            repository_name,
+            saved,
+            context,
+            workspace_phase="entering",
+            mode="context",
+            head=live["head"],
+            branch=live["branch"],
+            dirty=live["dirty"],
+        )
+        write_workspace_state(paths.state, entering)
+        current = entering
+        stash_message = f"ws-context:{lock.workspace_name}:{repository_name}:{token}"
+        if live["dirty"]:
+            current = _context_effect_intent(
+                paths,
+                current,
+                repository_name,
+                "stash",
+                "intent",
+                expected_refs={"HEAD": live["head"]},
+            )
+            try:
+                run_git(
+                    ["stash", "push", "--include-untracked", "-m", stash_message],
+                    cwd=worktree,
+                )
+                stash_oid = _find_stash_oid(worktree, stash_message)
+            except Exception as exc:
+                _context_effect_failure(paths, current, repository_name, "stash")
+                raise WsError(
+                    f"context stash creation failed; context remains in entering phase "
+                    f"with token {token}: {exc}"
+                ) from exc
+            current_context = current.repos[repository_name].context
+            assert current_context is not None
+            context = replace(current_context, stash_oid=stash_oid)
+            current = _set_context_state(
+                current,
+                repository_name,
+                current.repos[repository_name],
+                context,
+                workspace_phase="entering",
+                mode="context",
+                head=live["head"],
+                branch=live["branch"],
+                dirty=False,
+            )
+            current = _context_effect_outcome(
+                paths,
+                current,
+                repository_name,
+                "stash",
+                "outcome",
+                known_oids={"stash": stash_oid},
+            )
+            current = _context_effect_intent(
+                paths,
+                current,
+                repository_name,
+                "private_ref",
+                "intent",
+                known_oids={"stash": stash_oid},
+            )
+            try:
+                create_private_ref(private_ref, stash_oid, cwd=worktree)
+            except Exception as exc:
+                _context_effect_failure(
+                    paths,
+                    current,
+                    repository_name,
+                    "private_ref",
+                    known_oids={"stash": stash_oid},
+                )
+                raise WsError(
+                    f"context private snapshot pinning failed; context remains in entering "
+                    f"phase with stash {stash_oid}: {exc}"
+                ) from exc
+            current = _context_effect_outcome(
+                paths,
+                current,
+                repository_name,
+                "private_ref",
+                "outcome",
+                known_oids={"stash": stash_oid},
+            )
+        current = _context_effect_intent(
+            paths,
+            current,
+            repository_name,
+            "checkout",
+            "intent",
+            expected_refs={"HEAD": target_commit},
+        )
+        try:
+            run_git(["switch", "--detach", target_commit], cwd=worktree)
+        except Exception as exc:
+            _context_effect_failure(
+                paths,
+                current,
+                repository_name,
+                "checkout",
+                known_oids={"target": target_commit},
+            )
+            raise WsError(
+                f"context checkout failed; context remains in entering phase: {exc}"
+            ) from exc
+        current = _context_effect_outcome(
+            paths,
+            current,
+            repository_name,
+            "checkout",
+            "outcome",
+            known_oids={"target": target_commit},
+        )
+        final_context = current.repos[repository_name].context
+        assert final_context is not None
+        final_context = replace(final_context, phase="active")
+        final_live = _read_live_repo(worktree)
+        current = _set_context_state(
+            current,
+            repository_name,
+            current.repos[repository_name],
+            final_context,
+            workspace_phase="active",
+            mode="context",
+            head=final_live["head"],
+            branch=None,
+            dirty=final_live["dirty"],
+        )
+        write_workspace_state(paths.state, current)
+        if final_context.stash_oid is not None:
+            return (
+                f"Context active; stash {final_context.stash_oid} retained for manual cleanup "
+                f"(message: {stash_message})"
+            )
+        return None
+    finally:
+        if operation_acquired:
+            _release_operation_lock(paths.operation_lock)
+        if lifecycle_acquired:
+            _release_lifecycle_lock(paths.lifecycle_lock)
+
+
+def restore_context(repository_name: str) -> str | None:
+    validate_logical_name(repository_name, kind="repository")
+    paths = discover_workspace()
+    lifecycle_acquired, operation_acquired = _acquire_mutator_locks(paths)
+    try:
+        lock, state = _read_metadata(paths)
+        _validate_discovered_workspace_name(paths, lock)
+        _reject_context_mutation_during_removal(state)
+        locked = _locked_repo(lock, repository_name)
+        saved = state.repos[repository_name]
+        context = saved.context
+        if context is None or saved.mode != "context":
+            raise WsError(f"repository {repository_name!r} has no active temporary context")
+        if context.phase in {"entering", "restoring"}:
+            raise WsError(
+                f"context is in interrupted {context.phase} phase; manual recovery is required"
+            )
+        if context.phase == "restore_conflicted":
+            raise WsError(
+                "context restore is conflicted; use --finalize-restore after resolving it"
+            )
+        if context.phase not in {"active", "restore_failed"}:
+            raise WsError(f"cannot restore context in phase {context.phase!r}")
+        worktree = paths.workspace / "repos" / repository_name
+        validate_worktree_registration(locked.source_path, worktree)
+        if context.phase == "restore_failed":
+            _verify_return_baseline(locked.source_path, worktree, context)
+        else:
+            live = _read_live_repo(worktree)
+            if live["dirty"]:
+                raise WsError(
+                    "temporary context worktree has uncommitted changes; clean, commit, or "
+                    "stash them before restoring"
+                )
+            _verify_return_identity(locked.source_path, worktree, context)
+        restoring = _set_context_state(
+            state,
+            repository_name,
+            saved,
+            replace(context, phase="restoring"),
+            workspace_phase="restoring",
+            mode="context",
+            head=saved.head,
+            branch=None,
+            dirty=False,
+        )
+        write_workspace_state(paths.state, restoring)
+        current = _context_effect_intent(
+            paths,
+            restoring,
+            repository_name,
+            "return_checkout",
+            "intent",
+        )
+        return_head = context.return_saved_head
+        assert return_head is not None
+        try:
+            if context.return_mode == "claimed":
+                assert context.return_branch is not None
+                run_git(["switch", context.return_branch], cwd=worktree)
+            else:
+                run_git(["switch", "--detach", return_head], cwd=worktree)
+        except Exception as exc:
+            _context_effect_failure(
+                paths,
+                current,
+                repository_name,
+                "return_checkout",
+                known_oids={"return": return_head},
+            )
+            raise WsError(
+                f"context return checkout failed; restore remains blocked: {exc}"
+            ) from exc
+        current = _context_effect_outcome(
+            paths,
+            current,
+            repository_name,
+            "return_checkout",
+            "outcome",
+            known_oids={"return": return_head},
+        )
+        if context.stash_oid is not None:
+            assert context.private_ref is not None
+            current = _context_effect_intent(
+                paths,
+                current,
+                repository_name,
+                "stash_apply",
+                "intent",
+                known_oids={"stash": context.stash_oid},
+            )
+            try:
+                run_git(["stash", "apply", "--index", context.private_ref], cwd=worktree)
+            except Exception as exc:
+                current = _context_effect_failure(
+                    paths,
+                    current,
+                    repository_name,
+                    "stash_apply",
+                    known_oids={"stash": context.stash_oid},
+                )
+                if _has_unmerged_entries(worktree):
+                    current_context = current.repos[repository_name].context
+                    assert current_context is not None
+                    failed_context = replace(current_context, phase="restore_conflicted")
+                    conflicted = _set_context_state(
+                        current,
+                        repository_name,
+                        current.repos[repository_name],
+                        failed_context,
+                        workspace_phase="restore_conflicted",
+                        mode="context",
+                        head=context.return_saved_head,
+                        branch=context.return_branch,
+                        dirty=True,
+                    )
+                    write_workspace_state(paths.state, conflicted)
+                    raise WsError(
+                        f"context restore conflicted; stash {context.stash_oid} retained; "
+                        "resolve conflicts and run ws context "
+                        f"{repository_name} --finalize-restore"
+                    ) from exc
+                current_context = current.repos[repository_name].context
+                assert current_context is not None
+                failed_context = replace(current_context, phase="restore_failed")
+                failed = _set_context_state(
+                    current,
+                    repository_name,
+                    current.repos[repository_name],
+                    failed_context,
+                    workspace_phase="restore_failed",
+                    mode="context",
+                    head=context.return_saved_head,
+                    branch=context.return_branch,
+                    dirty=_read_live_repo(worktree)["dirty"],
+                )
+                write_workspace_state(paths.state, failed)
+                raise WsError(
+                    f"context stash apply failed; stash {context.stash_oid} and context state "
+                    "were retained; clean the exact return baseline before retrying"
+                ) from exc
+            current = _context_effect_outcome(
+                paths,
+                current,
+                repository_name,
+                "stash_apply",
+                "outcome",
+                known_oids={"stash": context.stash_oid},
+            )
+        if context.private_ref is not None:
+            current = _context_effect_intent(
+                paths,
+                current,
+                repository_name,
+                "private_ref_delete",
+                "intent",
+                known_oids={"stash": context.stash_oid or return_head},
+            )
+            try:
+                assert context.stash_oid is not None
+                delete_private_ref(context.private_ref, context.stash_oid, cwd=worktree)
+            except Exception as exc:
+                _context_effect_failure(
+                    paths,
+                    current,
+                    repository_name,
+                    "private_ref_delete",
+                    known_oids={"stash": context.stash_oid or return_head},
+                )
+                raise WsError(
+                    f"private context snapshot was not deleted; restore remains blocked: {exc}"
+                ) from exc
+            current = _context_effect_outcome(
+                paths,
+                current,
+                repository_name,
+                "private_ref_delete",
+                "outcome",
+                known_oids={"stash": context.stash_oid or return_head},
+            )
+        final_live = _read_live_repo(worktree)
+        restored = replace(
+            current,
+            phase="idle",
+            repos={
+                **current.repos,
+                repository_name: RepoState(
+                    name=repository_name,
+                    mode=context.return_mode,
+                    head=final_live["head"],
+                    branch=final_live["branch"],
+                    detached=final_live["detached"],
+                    dirty=final_live["dirty"],
+                    context=None,
+                ),
+            },
+        )
+        write_workspace_state(paths.state, restored)
+        if context.stash_oid is not None:
+            message = f"ws-context:{lock.workspace_name}:{repository_name}:{context.stash_token}"
+            return (
+                f"Context restored; stash {context.stash_oid} retained for manual cleanup "
+                f"(message: {message})"
+            )
+        return None
+    finally:
+        if operation_acquired:
+            _release_operation_lock(paths.operation_lock)
+        if lifecycle_acquired:
+            _release_lifecycle_lock(paths.lifecycle_lock)
+
+
+def finalize_restore(repository_name: str) -> str | None:
+    validate_logical_name(repository_name, kind="repository")
+    paths = discover_workspace()
+    lifecycle_acquired, operation_acquired = _acquire_mutator_locks(paths)
+    try:
+        lock, state = _read_metadata(paths)
+        _validate_discovered_workspace_name(paths, lock)
+        _reject_context_mutation_during_removal(state)
+        locked = _locked_repo(lock, repository_name)
+        saved = state.repos[repository_name]
+        context = saved.context
+        if context is None or context.phase != "restore_conflicted":
+            raise WsError("--finalize-restore is allowed only for a restore_conflicted context")
+        if context.private_ref is None or context.stash_oid is None:
+            raise WsError("conflicted context has no retained private snapshot to finalize")
+        worktree = paths.workspace / "repos" / repository_name
+        validate_worktree_registration(locked.source_path, worktree)
+        if _has_unmerged_entries(worktree):
+            raise WsError("cannot finalize restore while unmerged index entries remain")
+        current = _context_effect_intent(
+            paths,
+            state,
+            repository_name,
+            "private_ref_delete",
+            "intent",
+            known_oids={"stash": context.stash_oid},
+        )
+        try:
+            delete_private_ref(context.private_ref, context.stash_oid, cwd=worktree)
+        except Exception as exc:
+            _context_effect_failure(
+                paths,
+                current,
+                repository_name,
+                "private_ref_delete",
+                known_oids={"stash": context.stash_oid},
+            )
+            raise WsError(f"private context snapshot was not deleted: {exc}") from exc
+        current = _context_effect_outcome(
+            paths,
+            current,
+            repository_name,
+            "private_ref_delete",
+            "outcome",
+            known_oids={"stash": context.stash_oid},
+        )
+        live = _read_live_repo(worktree)
+        finalized = replace(
+            current,
+            phase="idle",
+            repos={
+                **current.repos,
+                repository_name: RepoState(
+                    name=repository_name,
+                    mode=context.return_mode,
+                    head=live["head"],
+                    branch=live["branch"],
+                    detached=live["detached"],
+                    dirty=live["dirty"],
+                    context=None,
+                ),
+            },
+        )
+        write_workspace_state(paths.state, finalized)
+        message = f"ws-context:{lock.workspace_name}:{repository_name}:{context.stash_token}"
+        return (
+            f"Context finalized; stash {context.stash_oid} retained for manual cleanup "
+            f"(message: {message})"
+        )
+    finally:
+        if operation_acquired:
+            _release_operation_lock(paths.operation_lock)
+        if lifecycle_acquired:
+            _release_lifecycle_lock(paths.lifecycle_lock)
+
+
+def _acquire_mutator_locks(paths: WorkspacePaths) -> tuple[bool, bool]:
+    try:
+        paths.lifecycle_lock.mkdir()
+    except FileExistsError as exc:
+        raise WsError(f"workspace lifecycle lock already exists: {paths.lifecycle_lock}") from exc
+    try:
+        paths.operation_lock.mkdir()
+    except FileExistsError as exc:
+        _release_lifecycle_lock(paths.lifecycle_lock)
+        raise WsError(f"workspace operation lock already exists: {paths.operation_lock}") from exc
+    return True, True
+
+
+def _locked_repo(lock: WorkspaceLock, repository_name: str) -> WorkspaceLockRepo:
+    locked = lock.repos.get(repository_name)
+    if locked is None:
+        raise WsError(
+            f"repository {repository_name!r} is not part of workspace {lock.workspace_name!r}"
+        )
+    return locked
+
+
+def _reject_context_mutation_during_removal(state: WorkspaceState) -> None:
+    if state.removal is not None or state.phase in REMOVAL_PHASES:
+        raise WsError("cannot mutate repository while workspace removal is durable")
+
+
+def _context_target_commit(locked: WorkspaceLockRepo, target_ref: str) -> str:
+    if target_ref == "default":
+        if locked.default_selector is None:
+            raise WsError(
+                f"repository {locked.name!r} has no locked default selector; "
+                "provide an explicit context ref"
+            )
+        target_ref = locked.default_selector
+    return _resolve_commit(locked.source_path, target_ref)
+
+
+def _set_context_state(
+    state: WorkspaceState,
+    repository_name: str,
+    saved: RepoState,
+    context: ContextState,
+    *,
+    workspace_phase: str,
+    mode: str,
+    head: str | None,
+    branch: str | None,
+    dirty: bool,
+) -> WorkspaceState:
+    repo = replace(
+        saved,
+        mode=mode,
+        head=head,
+        branch=branch,
+        detached=mode == "context" or branch is None,
+        dirty=dirty,
+        context=context,
+    )
+    return replace(
+        state,
+        phase=workspace_phase,
+        repos={**state.repos, repository_name: repo},
+    )
+
+
+def _context_effect_intent(
+    paths: WorkspacePaths,
+    state: WorkspaceState,
+    repository_name: str,
+    operation: str,
+    step: str,
+    *,
+    expected_refs: dict[str, str] | None = None,
+    known_oids: dict[str, str] | None = None,
+) -> WorkspaceState:
+    return _persist_context_effect(
+        paths,
+        state,
+        repository_name,
+        operation,
+        step,
+        expected_refs=expected_refs,
+        known_oids=known_oids,
+    )
+
+
+def _context_effect_outcome(
+    paths: WorkspacePaths,
+    state: WorkspaceState,
+    repository_name: str,
+    operation: str,
+    step: str,
+    *,
+    known_oids: dict[str, str] | None = None,
+) -> WorkspaceState:
+    return _persist_context_effect(
+        paths,
+        state,
+        repository_name,
+        operation,
+        step,
+        known_oids=known_oids,
+    )
+
+
+def _context_effect_failure(
+    paths: WorkspacePaths,
+    state: WorkspaceState,
+    repository_name: str,
+    operation: str,
+    *,
+    known_oids: dict[str, str] | None = None,
+) -> WorkspaceState:
+    return _persist_context_effect(
+        paths,
+        state,
+        repository_name,
+        operation,
+        "failure",
+        known_oids=known_oids,
+    )
+
+
+def _persist_context_effect(
+    paths: WorkspacePaths,
+    state: WorkspaceState,
+    repository_name: str,
+    operation: str,
+    step: str,
+    *,
+    expected_refs: dict[str, str] | None = None,
+    known_oids: dict[str, str] | None = None,
+) -> WorkspaceState:
+    saved = state.repos[repository_name]
+    context = saved.context
+    assert context is not None
+    effect = ContextSideEffect(
+        operation=operation,
+        step=step,
+        expected_refs={} if expected_refs is None else expected_refs,
+        known_oids={} if known_oids is None else known_oids,
+    )
+    updated_context = replace(context, completed_effects=(*context.completed_effects, effect))
+    updated = replace(
+        state, repos={**state.repos, repository_name: replace(saved, context=updated_context)}
+    )
+    write_workspace_state(paths.state, updated)
+    return updated
+
+
+def _find_stash_oid(worktree: Path, message: str) -> str:
+    result = run_git(["stash", "list", "--format=%H%x00%s"], cwd=worktree)
+    matches = [
+        record.split("\0", 1)[0]
+        for record in result.stdout.splitlines()
+        if "\0" in record
+        and (
+            record.split("\0", 1)[1] == message or record.split("\0", 1)[1].endswith(f": {message}")
+        )
+    ]
+    if len(matches) != 1:
+        raise WsError(
+            f"could not identify exactly one context stash by token; found {len(matches)}"
+        )
+    return matches[0]
+
+
+def _verify_return_identity(source: Path, worktree: Path, context: ContextState) -> None:
+    if context.return_mode == "claimed":
+        if context.return_branch is None:
+            raise WsError("context return record is missing its claimed branch")
+        branch = run_git(
+            ["rev-parse", "--verify", f"refs/heads/{context.return_branch}^{{commit}}"],
+            cwd=source,
+            check=False,
+        )
+        if branch.returncode != 0 or branch.stdout.strip() != context.return_saved_head:
+            raise WsError("saved return branch no longer points at its recorded HEAD")
+        for entry in list_worktrees(source):
+            if entry.branch == context.return_branch and entry.path != worktree.resolve():
+                raise WsError("saved return branch is checked out by another worktree")
+    else:
+        return_head = context.return_saved_head
+        assert return_head is not None
+        _verify_commit_exists(worktree, return_head)
+
+
+def _verify_return_baseline(source: Path, worktree: Path, context: ContextState) -> None:
+    _verify_return_identity(source, worktree, context)
+    live = _read_live_repo(worktree)
+    expected_branch = context.return_branch if context.return_mode == "claimed" else None
+    if live["branch"] != expected_branch or live["head"] != context.return_saved_head:
+        raise WsError("restore retry requires the exact saved return branch and HEAD")
+    if live["dirty"] or _has_unmerged_entries(worktree):
+        raise WsError("restore retry requires a clean return baseline with no unmerged entries")
+
+
+def _verify_commit_exists(worktree: Path, commit: str) -> None:
+    result = run_git(["cat-file", "-e", f"{commit}^{{commit}}"], cwd=worktree, check=False)
+    if result.returncode != 0:
+        raise WsError(f"saved return commit is no longer available: {commit}")
+
+
+def _has_unmerged_entries(worktree: Path) -> bool:
+    return bool(run_git(["ls-files", "--unmerged"], cwd=worktree).stdout.strip())
 
 
 def status_workspace(start: Path | None = None) -> dict[str, Any]:
