@@ -1,24 +1,28 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
+
+from .errors import WsError
+from .workspace import create_workspace, render_status_human, status_workspace
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ws",
         description="Manage isolated multi-repository Git workspaces.",
-        epilog="Phase 1 syntax: ws create <workspace> [--config PATH]",
+        epilog="Phase 2A syntax: ws create <workspace> [--config PATH]",
     )
     commands = parser.add_subparsers(dest="command")
 
-    create = commands.add_parser("create", help="create a workspace (future phase)")
+    create = commands.add_parser("create", help="create a detached workspace")
     create.add_argument("workspace")
     create.add_argument("--config", type=str)
     create.add_argument("--source", action="append", default=[])
 
-    status = commands.add_parser("status", help="show workspace state (future phase)")
+    status = commands.add_parser("status", help="show workspace state")
     status.add_argument("--json", action="store_true")
 
     claim = commands.add_parser("claim", help="claim a repository (future phase)")
@@ -48,8 +52,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         return exc.code if isinstance(exc.code, int) else 2
 
-    if args.command is None:
-        parser.print_help()
-        return 0
-    print(f"ws {args.command} is not implemented in Phase 1", file=sys.stderr)
-    return 2
+    try:
+        if args.command is None:
+            parser.print_help()
+            return 0
+        if args.command == "create":
+            paths = create_workspace(
+                args.workspace,
+                config_path=args.config,
+                source_overrides=args.source,
+            )
+            print(f"Created workspace {paths.workspace}")
+            return 0
+        if args.command == "status":
+            payload = status_workspace()
+            if args.json:
+                print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+            else:
+                print(render_status_human(payload))
+            return 0
+        print(f"ws {args.command} is not implemented in Phase 2A", file=sys.stderr)
+        return 2
+    except (WsError, OSError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1

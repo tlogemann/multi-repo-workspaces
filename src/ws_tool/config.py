@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import tomllib
 from collections.abc import Collection, Iterable
 from pathlib import Path
@@ -9,24 +8,15 @@ from typing import Any
 from .errors import ConfigError
 from .git import repository_kind
 from .models import ProjectConfig, RepoConfig
-
-_LOGICAL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+from .validation import InvalidLogicalName
+from .validation import validate_logical_name as _validate_logical_name
 
 
 def validate_logical_name(name: str, *, kind: str) -> str:
-    if (
-        not name
-        or name in {".", ".."}
-        or "/" in name
-        or "\\" in name
-        or any(ord(char) < 32 or ord(char) == 127 for char in name)
-        or not _LOGICAL_NAME.fullmatch(name)
-    ):
-        raise ConfigError(
-            f"invalid {kind} identifier {name!r}; expected "
-            "[A-Za-z0-9][A-Za-z0-9._-]*"
-        )
-    return name
+    try:
+        return _validate_logical_name(name, kind=kind)
+    except InvalidLogicalName as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def parse_source_overrides(
@@ -37,9 +27,7 @@ def parse_source_overrides(
     for override in overrides:
         repository, separator, ref = override.partition("=")
         if not separator:
-            raise ConfigError(
-                f"malformed source override {override!r}; expected repo=ref"
-            )
+            raise ConfigError(f"malformed source override {override!r}; expected repo=ref")
         if (
             not repository
             or not ref

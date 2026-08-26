@@ -10,8 +10,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
-from .config import validate_logical_name
-from .errors import ConfigError, SerializationError
+from .errors import SerializationError
 from .models import (
     CONTEXT_PHASES,
     REMOVAL_PHASES,
@@ -28,6 +27,7 @@ from .models import (
     WorkspaceLockRepo,
     WorkspaceState,
 )
+from .validation import InvalidLogicalName, validate_logical_name
 
 _BARE_KEY = re.compile(r"[A-Za-z0-9_-]+\Z")
 
@@ -189,9 +189,7 @@ def serialize_workspace_state(state: WorkspaceState) -> str:
     _validate_state(state)
     state_data: dict[str, Any] = {
         "phase": state.phase,
-        "repos": {
-            name: _repo_state_data(repo_state) for name, repo_state in state.repos.items()
-        },
+        "repos": {name: _repo_state_data(repo_state) for name, repo_state in state.repos.items()},
     }
     if state.removal is not None:
         state_data["removal"] = {
@@ -344,9 +342,7 @@ def _parse_effects(value: Any, label: str) -> tuple[ContextSideEffect, ...]:
                 expected_refs=_string_map(
                     effect.get("expected_refs", {}), f"{label}.{key}.expected_refs"
                 ),
-                known_oids=_string_map(
-                    effect.get("known_oids", {}), f"{label}.{key}.known_oids"
-                ),
+                known_oids=_string_map(effect.get("known_oids", {}), f"{label}.{key}.known_oids"),
             )
         )
     return tuple(effects)
@@ -362,12 +358,8 @@ def _parse_removal_repo(value: Any, label: str) -> RemovalRepoState:
     repo = _table(value, label)
     return RemovalRepoState(
         name=_string(repo.get("name"), f"{label}.name"),
-        worktree_path=Path(
-            _string(repo.get("worktree_path"), f"{label}.worktree_path")
-        ),
-        git_admin_path=Path(
-            _string(repo.get("git_admin_path"), f"{label}.git_admin_path")
-        ),
+        worktree_path=Path(_string(repo.get("worktree_path"), f"{label}.worktree_path")),
+        git_admin_path=Path(_string(repo.get("git_admin_path"), f"{label}.git_admin_path")),
         complete=_bool(repo.get("complete"), f"{label}.complete"),
     )
 
@@ -557,7 +549,7 @@ def _validate_removal(removal: RemovalState, workspace_name: str) -> None:
 def _safe_id(value: str, label: str) -> None:
     try:
         validate_logical_name(value, kind="metadata")
-    except ConfigError as exc:
+    except InvalidLogicalName as exc:
         raise SerializationError(f"{label} is not a safe logical identifier: {exc}") from exc
 
 

@@ -4,8 +4,16 @@ from pathlib import Path
 
 import pytest
 
-from ws_tool.errors import GitCommandError
-from ws_tool.git import create_private_ref, delete_private_ref, is_git_repository, run_git
+from ws_tool.errors import GitCommandError, GitWorktreeError
+from ws_tool.git import (
+    create_private_ref,
+    delete_private_ref,
+    is_git_repository,
+    list_worktrees,
+    run_git,
+    validate_worktree_registration,
+    worktree_admin_path,
+)
 
 
 def test_git_boundary_uses_real_git_and_returns_machine_result(tmp_path: Path) -> None:
@@ -101,3 +109,40 @@ def test_private_ref_helpers_never_dereference_existing_symbolic_refs(git_repo) 
     delete_private_ref(private_ref, first, cwd=repo.path)
     assert run_git(["rev-parse", outside_ref], cwd=repo.path).stdout.strip() == first
     assert run_git(["symbolic-ref", private_ref], cwd=repo.path, check=False).returncode != 0
+
+
+def test_worktree_registration_exposes_stable_git_admin_identity(git_repo, tmp_path: Path) -> None:
+    repo = git_repo("registration")
+    worktree = tmp_path / "linked é space"
+    run_git(["worktree", "add", "--detach", worktree, "HEAD"], cwd=repo.path)
+
+    identity = validate_worktree_registration(repo.path, worktree)
+
+    assert identity.path == worktree.resolve()
+    assert identity.git_admin_path == worktree_admin_path(worktree)
+    assert any(entry.path == worktree.resolve() for entry in list_worktrees(repo.path))
+
+
+def test_worktree_registration_rejects_unregistered_path(git_repo, tmp_path: Path) -> None:
+    repo = git_repo("registration-missing")
+
+    with pytest.raises(GitWorktreeError, match="not registered"):
+        validate_worktree_registration(repo.path, tmp_path / "missing")
+
+
+def test_worktree_registration_uses_common_dir_for_linked_source_worktrees(
+    git_repo, tmp_path: Path
+) -> None:
+    repo = git_repo("linked-source")
+    linked_source = tmp_path / "source-worktree"
+    child = tmp_path / "child"
+    run_git(["worktree", "add", "--detach", linked_source, "HEAD"], cwd=repo.path)
+    run_git(["worktree", "add", "--detach", child, "HEAD"], cwd=linked_source)
+
+    identity = validate_worktree_registration(linked_source, child)
+    common_dir = Path(
+        run_git(["rev-parse", "--git-common-dir"], cwd=linked_source).stdout.strip()
+    ).resolve()
+
+    assert identity.git_admin_path.parent == common_dir / "worktrees"
+    assert identity.source_git_common_dir == common_dir

@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .errors import GitCommandError
+from .errors import GitCommandError, GitWorktreeError
 
 _GIT_ROUTING_ENVIRONMENT = frozenset(
     {
@@ -34,6 +34,20 @@ class GitResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True)
+class WorktreeEntry:
+    path: Path
+    head: str | None
+    branch: str | None
+
+
+@dataclass(frozen=True)
+class WorktreeIdentity:
+    path: Path
+    git_admin_path: Path
+    source_git_common_dir: Path
 
 
 def run_git(
@@ -117,3 +131,69 @@ def repository_kind(path: Path) -> str | None:
 
 def is_git_repository(path: Path) -> bool:
     return repository_kind(path) is not None
+
+
+def list_worktrees(source: Path) -> tuple[WorktreeEntry, ...]:
+    result = run_git(["worktree", "list", "--porcelain", "-z"], cwd=source)
+    entries: list[WorktreeEntry] = []
+    current: dict[str, str] = {}
+    for record in (*result.stdout.split("\0"), ""):
+        if not record:
+            if "worktree" in current:
+                entries.append(
+                    WorktreeEntry(
+                        path=Path(current["worktree"]).resolve(strict=False),
+                        head=current.get("HEAD"),
+                        branch=current.get("branch"),
+                    )
+                )
+            current = {}
+            continue
+        key, _, value = record.partition(" ")
+        if key == "branch":
+            current[key] = value.removeprefix("refs/heads/")
+        elif key in {"worktree", "HEAD"}:
+            current[key] = value
+    return tuple(entries)
+
+
+def worktree_admin_path(worktree: Path) -> Path:
+    result = run_git(["rev-parse", "--git-dir"], cwd=worktree)
+    admin = Path(result.stdout.strip())
+    if not admin.is_absolute():
+        admin = worktree / admin
+    return admin.resolve(strict=False)
+
+
+def validate_worktree_registration(source: Path, expected_path: Path) -> WorktreeIdentity:
+    expected = expected_path.resolve(strict=False)
+    entry = next((item for item in list_worktrees(source) if item.path == expected), None)
+    if entry is None:
+        raise GitWorktreeError(
+            f"expected worktree is not registered by source {source}: {expected}"
+        )
+    admin = worktree_admin_path(expected)
+    source_common_result = run_git(["rev-parse", "--git-common-dir"], cwd=source)
+    source_common_dir = Path(source_common_result.stdout.strip())
+    if not source_common_dir.is_absolute():
+        source_common_dir = source / source_common_dir
+    source_common_dir = source_common_dir.resolve(strict=False)
+    expected_admin_parent = source_common_dir / "worktrees"
+    if admin.parent != expected_admin_parent:
+        raise GitWorktreeError(
+            f"Git administrative identity for {expected} is outside source worktrees: {admin}"
+        )
+    gitdir_file = admin / "gitdir"
+    try:
+        gitdir = Path(gitdir_file.read_text(encoding="utf-8").strip())
+    except OSError as exc:
+        raise GitWorktreeError(
+            f"cannot read Git administrative identity for {expected}: {gitdir_file}"
+        ) from exc
+    if not gitdir.is_absolute():
+        gitdir = admin / gitdir
+    if gitdir.resolve(strict=False) != (expected / ".git").resolve(strict=False):
+        raise GitWorktreeError(
+            f"Git administrative identity does not point to expected worktree {expected}"
+        )
+    return WorktreeIdentity(expected, admin, source_common_dir)

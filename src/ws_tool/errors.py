@@ -35,3 +35,7 @@ class GitCommandError(WsError):
         location = f" in {cwd}" if cwd is not None else ""
         detail = stderr.strip() or stdout.strip() or "no output"
         super().__init__(f"Git command failed{location}: {command} (exit {returncode}): {detail}")
+
+
+class GitWorktreeError(WsError):
+    """Git worktree registration or identity did not match expectations."""

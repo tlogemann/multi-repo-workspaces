@@ -251,9 +251,7 @@ def test_context_mode_requires_detached_repository_and_allows_detached_return_mo
     state = WorkspaceState(
         workspace_name="demo",
         phase="active",
-        repos={
-            "app": RepoState(name="app", mode="context", detached=True, context=context)
-        },
+        repos={"app": RepoState(name="app", mode="context", detached=True, context=context)},
     )
 
     assert deserialize_workspace_state(serialize_workspace_state(state)) == state
@@ -396,7 +394,7 @@ def _lock_text(
     default_selector: str = "",
     extra_repos: str = "",
 ) -> str:
-    selector = f'\ndefault_selector = {default_selector}' if default_selector else ""
+    selector = f"\ndefault_selector = {default_selector}" if default_selector else ""
     return (
         f'schema_version = 1\n\n[workspace]\nname = "{workspace_name}"\n\n'
         f'[repos.{repo_key}]\nname = "{embedded_name}"\nsource_path = "{source_path}"\n'
@@ -413,8 +411,10 @@ def _lock_text(
         (_lock_text(source_path="relative/source"), "absolute canonical path"),
         (_lock_text(base_commit="deadbeef"), "full Git object ID"),
         (
-            _lock_text(extra_repos='\n[repos.lib]\nname = "lib"\nsource_path = "/missing/source"\n'
-            'base_ref = "origin/main"\nbase_commit = "' + "b" * 40 + '"\n'),
+            _lock_text(
+                extra_repos='\n[repos.lib]\nname = "lib"\nsource_path = "/missing/source"\n'
+                'base_ref = "origin/main"\nbase_commit = "' + "b" * 40 + '"\n'
+            ),
             "duplicate canonical source path",
         ),
         (_lock_text(default_selector='["origin/main"]'), "must be a string when present"),
@@ -457,7 +457,7 @@ def _state_text(
                     '[state.removal.repos.app]\nname = "app"\n'
                     'worktree_path = "/workspaces/demo/app"\n'
                     'git_admin_path = "/sources/app/.git/worktrees/demo-app"\n'
-                    'complete = false\n'
+                    "complete = false\n"
                 ),
             ),
             "tombstone path",
@@ -472,7 +472,7 @@ def _state_text(
                     '[state.removal.repos.app]\nname = "app"\n'
                     'worktree_path = "/outside/app"\n'
                     'git_admin_path = "/sources/app/.git/worktrees/demo-app"\n'
-                    'complete = false\n'
+                    "complete = false\n"
                 ),
             ),
             "inside workspace path",
@@ -492,7 +492,7 @@ def test_rejects_context_with_unknown_phase_and_missing_recovery_fields() -> Non
             '\n[state.repos.app.context]\ntarget_ref = "default"\n'
             f'target_commit = "{"a" * 40}"\nphase = "lost"\nreturn_mode = "claimed"\n'
             'stash_token = "token"\nreturn_saved_head = "' + "a" * 40 + '"\n'
-        )
+        ),
     )
 
     with pytest.raises(SerializationError, match="unknown value"):
@@ -525,7 +525,7 @@ def test_rejects_malformed_context_recovery_records(
             f'stash_token = "{stash_token}"\n'
             f'return_saved_head = "{saved_head}"\n'
             f'private_ref = "{private_ref}"\n'
-        )
+        ),
     )
 
     with pytest.raises(SerializationError, match=message):
