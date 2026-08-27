@@ -7,8 +7,8 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from test_phase2 import adopt_source, initialize_sources, repo_table
+
 from ws_tool.serialization import deserialize_removal_seal, deserialize_workspace_state
 
 

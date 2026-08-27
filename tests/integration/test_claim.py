@@ -5,7 +5,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from test_phase2 import adopt_source, initialize_sources, repo_table as _repo_table
+from test_phase2 import adopt_source, hydrate_source_refs, initialize_sources
+from test_phase2 import repo_table as _repo_table
+
 from ws_tool.git import worktree_admin_path
 from ws_tool.models import ContextState, RemovalRepoState, RemovalState, RepoState, WorkspaceState
 from ws_tool.serialization import write_workspace_state
@@ -60,6 +62,13 @@ def create_config(tmp_path: Path, source, *, default_ref: str | None = None) -> 
             capture_output=True,
             text=True,
         )
+        subprocess.run(
+            ["git", "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+            cwd=config_dir / "repos" / "app",
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     return config
 
 
@@ -109,6 +118,7 @@ def test_claim_explicit_source_and_target(tmp_path: Path, git_repo) -> None:
     base = source.run("rev-parse", "feature/base").stdout.strip()
     source.commit("main advance", content="main advance\n")
     config = create_config(tmp_path, source)
+    hydrate_source_refs(config.parent / "repos" / "app")
     workspace = create_workspace(tmp_path, source.path, "explicit", config)
 
     result = run_ws(
@@ -175,6 +185,7 @@ def test_claim_rejects_existing_target_branch_without_mutating_detached_worktree
     source = git_repo("claim-collision")
     source.branch("feature/existing")
     config = create_config(tmp_path, source)
+    hydrate_source_refs(config.parent / "repos" / "app")
     workspace = create_workspace(tmp_path, source.path, "collision", config)
     worktree = workspace / "repos" / "app"
     before = git_output(worktree, "rev-parse", "HEAD")

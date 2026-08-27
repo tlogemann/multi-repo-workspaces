@@ -5,13 +5,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+from test_phase2 import adopt_source, initialize_sources, repo_table
+
 from conftest import (
     release_boundary,
     start_paused_create,
     start_paused_remove,
     wait_for_boundary,
 )
-from test_phase2 import adopt_source, initialize_sources, repo_table
 
 
 def run_ws(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:

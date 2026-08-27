@@ -8,8 +8,9 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from test_phase2 import adopt_source, hydrate_source_refs, initialize_sources
+from test_phase2 import repo_table as _repo_table
 
-from test_phase2 import adopt_source, initialize_sources, repo_table as _repo_table
 import ws_tool.workspace as workspace_module
 from ws_tool.errors import GitCommandError, WsError
 from ws_tool.serialization import deserialize_workspace_state, serialize_workspace_state
@@ -260,6 +261,7 @@ def test_detached_context_restores_detached_head_and_explicit_ref(tmp_path: Path
     config.parent.mkdir()
     write_config(config, source.path)
     initialize_sources(config.parent)
+    hydrate_source_refs(config.parent / "repos" / "app")
     adopt_source(source, config.parent, "app")
     result = run_ws(config.parent, "create", "detached", "--config", str(config))
     assert result.returncode == 0, result.stderr
@@ -335,7 +337,7 @@ def test_context_checkout_failure_persists_target_commit_and_no_recovery(
     tmp_path: Path, git_repo, monkeypatch
 ) -> None:
     source = git_repo("failure-checkout")
-    workspace = create_workspace(tmp_path, source, "failure-checkout")
+    workspace = create_workspace(tmp_path, source, "failure-checkout", default_ref="main")
     worktree = workspace / "repos" / "app"
     assert run_ws(worktree, "claim", "app", "--target", "feature/failure-checkout").returncode == 0
     target_head = source.commit("context target", content="context target\n")
@@ -552,6 +554,7 @@ def test_conflicted_restore_requires_finalize_and_retains_private_snapshot(
     source.run("worktree", "remove", str(alternate_worktree))
     source.run("branch", "other", alternate_head)
     workspace = create_workspace(tmp_path, source, "conflict")
+    hydrate_source_refs(workspace.parent.parent / "repos" / "app")
     worktree = workspace / "repos" / "app"
     assert run_ws(worktree, "claim", "app", "--target", "feature/conflict").returncode == 0
     (worktree / "README.md").write_text("saved change\n", encoding="utf-8")

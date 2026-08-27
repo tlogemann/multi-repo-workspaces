@@ -8,8 +8,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-
 from test_phase2 import adopt_source, initialize_sources, repo_table
+
 import ws_tool.workspace as workspace_module
 from ws_tool.errors import GitCommandError, WsError
 from ws_tool.models import RemovalSeal

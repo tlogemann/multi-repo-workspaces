@@ -11,7 +11,7 @@ import pytest
 
 import ws_tool.workspace as workspace_module
 from ws_tool.errors import GitCommandError, WsError
-from ws_tool.git import worktree_admin_path
+from ws_tool.git import remote_symbolic_heads, worktree_admin_path
 from ws_tool.models import ContextState, RemovalRepoState, RemovalState, RepoState, WorkspaceState
 from ws_tool.serialization import deserialize_workspace_lock, write_workspace_state
 from ws_tool.workspace import create_workspace
@@ -60,50 +60,52 @@ def repo_table(name: str, source: Path, default_ref: str | None = None) -> str:
 def initialize_sources(project_root: Path) -> None:
     result = run_ws(project_root, "init")
     assert result.returncode == 0, result.stderr
-    for source in (project_root / "repos").iterdir():
-        fetched = subprocess.run(
-            [
-                "git",
-                "fetch",
-                "origin",
-                "+refs/heads/*:refs/remotes/origin/*",
-                "+refs/tags/*:refs/tags/*",
-            ],
-            cwd=source,
-            text=True,
-            capture_output=True,
-        )
-        assert fetched.returncode == 0, fetched.stderr
-        current = subprocess.run(
-            ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
-            cwd=source,
-            text=True,
-            capture_output=True,
-            check=False,
-        ).stdout.strip()
-        branches = subprocess.run(
-            ["git", "for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/origin"],
-            cwd=source,
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        for branch in branches.stdout.splitlines():
-            if branch not in {"HEAD", current}:
-                subprocess.run(
-                    ["git", "branch", "--force", branch, f"refs/remotes/origin/{branch}"],
-                    cwd=source,
-                    text=True,
-                    capture_output=True,
-                    check=True,
-                )
-        subprocess.run(
-            ["git", "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
-            cwd=source,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+
+
+def hydrate_source_refs(source: Path) -> None:
+    fetched = subprocess.run(
+        [
+            "git",
+            "fetch",
+            "origin",
+            "+refs/heads/*:refs/remotes/origin/*",
+            "+refs/tags/*:refs/tags/*",
+        ],
+        cwd=source,
+        text=True,
+        capture_output=True,
+    )
+    assert fetched.returncode == 0, fetched.stderr
+    current = subprocess.run(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=source,
+        text=True,
+        capture_output=True,
+        check=False,
+    ).stdout.strip()
+    branches = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/origin"],
+        cwd=source,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    for branch in branches.stdout.splitlines():
+        if branch not in {"HEAD", current}:
+            subprocess.run(
+                ["git", "branch", "--force", branch, f"refs/remotes/origin/{branch}"],
+                cwd=source,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+    subprocess.run(
+        ["git", "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        cwd=source,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def copy_remote_metadata(source: Path, destination: Path) -> None:
@@ -143,6 +145,12 @@ def initialized_source(project_root: Path, name: str) -> Path:
 
 def adopt_source(source, project_root: Path, name: str) -> None:
     source.path = initialized_source(project_root, name)
+    subprocess.run(["git", "config", "user.name", "Workspace Test"], cwd=source.path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "workspace-test@example.test"],
+        cwd=source.path,
+        check=True,
+    )
 
 
 def test_create_multi_repo_and_status_from_nested_directory(tmp_path: Path, git_repo) -> None:
@@ -158,6 +166,8 @@ def test_create_multi_repo_and_status_from_nested_directory(tmp_path: Path, git_
         repo_table("app", app.path) + repo_table("library", library.path),
     )
     initialize_sources(config_dir)
+    hydrate_source_refs(config_dir / "repos" / "app")
+    hydrate_source_refs(config_dir / "repos" / "library")
     adopt_source(app, config_dir, "app")
     adopt_source(library, config_dir, "library")
 
@@ -225,6 +235,9 @@ def test_create_source_override_branch_tag_and_sha(tmp_path: Path, git_repo) -> 
         + repo_table("sha", sha_source.path),
     )
     initialize_sources(config_dir)
+    hydrate_source_refs(config_dir / "repos" / "branch")
+    hydrate_source_refs(config_dir / "repos" / "tag")
+    hydrate_source_refs(config_dir / "repos" / "sha")
     branch_source = initialized_source(config_dir, "branch")
     tag_source = initialized_source(config_dir, "tag")
     sha_source = initialized_source(config_dir, "sha")
@@ -321,7 +334,16 @@ def test_create_bare_source_with_explicit_override_records_null_default(
         repo_table("bare", bare),
     )
     initialize_sources(config_dir)
-    subprocess.run(["git", "switch", "--detach", "HEAD"], cwd=config_dir / "repos" / "bare", check=True)
+    subprocess.run(
+        ["git", "switch", "--detach", "HEAD"],
+        cwd=config_dir / "repos" / "bare",
+        check=True,
+    )
+    subprocess.run(
+        ["git", "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        cwd=config_dir / "repos" / "bare",
+        check=False,
+    )
 
     result = run_ws(
         config_dir,
@@ -335,7 +357,9 @@ def test_create_bare_source_with_explicit_override_records_null_default(
 
     assert result.returncode == 0, result.stderr
     lock = deserialize_workspace_lock(
-        (config_dir / "workspaces" / "bare-demo" / "workspace.lock.toml").read_text(encoding="utf-8")
+        (config_dir / "workspaces" / "bare-demo" / "workspace.lock.toml").read_text(
+            encoding="utf-8"
+        )
     )
     assert lock.repos["bare"].default_selector is None
     assert (config_dir / "workspaces" / "bare-demo" / "repos" / "bare").is_dir()
@@ -382,25 +406,37 @@ def test_explicit_source_allows_ambiguous_remote_defaults_in_bare_source(
     seed.run("push", "origin", "main")
     seed.run("push", "origin", "develop")
     seed.run("--git-dir", str(bare), "symbolic-ref", "HEAD", "refs/heads/main")
-    seed.run(
-        "--git-dir",
-        str(bare),
-        "symbolic-ref",
-        "refs/remotes/origin/HEAD",
-        "refs/remotes/origin/main",
-    )
-    seed.run(
-        "--git-dir",
-        str(bare),
-        "symbolic-ref",
-        "refs/remotes/upstream/HEAD",
-        "refs/remotes/origin/develop",
-    )
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", bare))
     initialize_sources(config_dir)
-    subprocess.run(["git", "switch", "--detach", "HEAD"], cwd=config_dir / "repos" / "app", check=True)
+    subprocess.run(
+        ["git", "switch", "--detach", "HEAD"],
+        cwd=config_dir / "repos" / "app",
+        check=True,
+    )
+    initialized = config_dir / "repos" / "app"
+    main_commit = run_git_output(initialized, "rev-parse", "refs/remotes/origin/main")
+    develop_commit = run_git_output(initialized, "rev-parse", "refs/remotes/origin/develop")
+    subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+        cwd=initialized,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/upstream/develop", develop_commit],
+        cwd=initialized,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/upstream/HEAD", "refs/remotes/upstream/develop"],
+        cwd=initialized,
+        check=True,
+    )
+    heads = remote_symbolic_heads(initialized)
+    assert len(heads) == 2
+    assert main_commit != develop_commit
+    assert len({commit for _head, _target, commit in heads}) == 2
 
     result = run_ws(
         config_dir,
@@ -496,16 +532,22 @@ def test_create_rejects_unresolvable_remote_symbolic_head(
     remote = bare_git_repo("origin.git")
     source.add_remote(remote)
     tree_oid = source.run("rev-parse", "HEAD^{tree}").stdout.strip()
-    source.run("update-ref", "refs/remotes/origin/not-a-commit", tree_oid)
-    source.run(
-        "symbolic-ref",
-        "refs/remotes/origin/HEAD",
-        "refs/remotes/origin/not-a-commit",
+    remote_symbolic = "refs/remotes/origin/not-a-commit"
+    remote_head = "refs/remotes/origin/HEAD"
+    subprocess.run(
+        ["git", "--git-dir", str(remote), "symbolic-ref", "HEAD", "refs/heads/main"],
+        check=True,
     )
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", remote))
     initialize_sources(config_dir)
+    initialized = config_dir / "repos" / "app"
+    subprocess.run(["git", "update-ref", remote_symbolic, tree_oid], cwd=initialized, check=True)
+    subprocess.run(
+        ["git", "symbolic-ref", remote_head, remote_symbolic], cwd=initialized, check=True
+    )
+    assert run_git_output(initialized, "symbolic-ref", remote_head) == remote_symbolic
 
     result = run_ws(config_dir, "create", "invalid", "--config", str(config))
 
