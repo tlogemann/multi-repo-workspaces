@@ -93,6 +93,13 @@ def init_workspace(*, cwd: Path | None = None) -> Path:
     clone_root = root / "repos"
     if clone_root.exists() or clone_root.is_symlink():
         raise WsError(f"source clone root already exists: {clone_root}")
+    for repo in project.repos.values():
+        expected_source = (clone_root / repo.name).resolve(strict=False)
+        if repo.source_path.resolve(strict=False) != expected_source:
+            raise WsError(
+                f"repository {repo.name!r} source path is not under the workspace clone root: "
+                f"{repo.source_path}"
+            )
     clone_root.mkdir()
     try:
         for repo in project.repos.values():

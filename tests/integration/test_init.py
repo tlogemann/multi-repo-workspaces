@@ -71,6 +71,30 @@ def test_init_rolls_back_after_failed_second_clone(tmp_path: Path, git_repo, bar
     assert root_sentinel.read_text(encoding="utf-8") == "unrelated\n"
 
 
+def test_init_rejects_symlinked_config_before_external_mutation(
+    tmp_path: Path, git_repo, bare_git_repo
+) -> None:
+    api = seed_bare_repo(git_repo, bare_git_repo, "api")
+    external = tmp_path / "external"
+    external.mkdir()
+    write_init_config(
+        external / "ws.toml",
+        [("api", str(api)), ("web", str(external / "missing-web.git"))],
+    )
+    external_repos = external / "repos"
+    external_repos.mkdir()
+    external_sentinel = external_repos / "sentinel"
+    external_sentinel.write_text("keep\n", encoding="utf-8")
+    (tmp_path / "ws.toml").symlink_to(external / "ws.toml")
+
+    result = run_ws(tmp_path, "init")
+
+    assert result.returncode != 0
+    assert not (tmp_path / "repos").exists()
+    assert not (external_repos / "api").exists()
+    assert external_sentinel.read_text(encoding="utf-8") == "keep\n"
+
+
 def test_create_requires_initialized_source_clone(tmp_path: Path, git_repo, bare_git_repo) -> None:
     api = seed_bare_repo(git_repo, bare_git_repo, "api")
     write_init_config(tmp_path / "ws.toml", [("api", str(api))])
