@@ -6,23 +6,35 @@ The primary target use case is a software project composed of multiple independe
 
 # 1. Core mental model
 
-A logical workspace consists of multiple Git worktrees:
+The project root contains the configured source clones and named feature
+workspaces:
 
 ```text
-workspace/
+project/
+├── ws.toml
 ├── repos/
 │   ├── app/
 │   ├── library/
 │   └── tools/
-├── workspace.lock.toml
-└── .ws/
-    └── state.toml
+└── workspaces/
+    └── feature-x/
+        ├── repos/
+        │   ├── app/
+        │   ├── library/
+        │   └── tools/
+        ├── workspace.lock.toml
+        └── .ws/
+            └── state.toml
 ```
 
 The fundamental rules are:
 
-* A project configuration defines multiple existing source Git repositories.
-* Creating a workspace creates one Git worktree per configured repository.
+* A project configuration defines multiple remote Git repositories with
+  `[[repos]]` entries.
+* `ws init` clones each configured repository into the project's `repos/`
+  source-clone root.
+* Creating a feature workspace creates one Git worktree per initialized source
+  clone under `workspaces/<feature>/repos/`.
 * Every repository starts at an immutable resolved commit with **detached HEAD**.
 * Detached repositories are fully available as source/context for humans and coding agents.
 * A repository only gets a real editable branch when explicitly `claim`ed.
@@ -34,6 +46,7 @@ The fundamental rules are:
 The primary commands for this first version are:
 
 ```bash
+ws init
 ws create <workspace> [--config PATH]
 ws status
 ws claim <repo>
@@ -134,110 +147,57 @@ Use a project-level TOML configuration named `ws.toml`.
 For example:
 
 ```toml
+[[repos]]
+url = "git@github.com:acme/api.git"
 default_ref = "main"
-
-[project]
-workspace_root = "../workspaces"
-
-[repos.app]
-path = "../repos/app"
-
-[repos.library]
-path = "../repos/library"
-default_ref = "develop"
-
-[repos.tools]
-path = "../repos/tools"
 ```
 
-The root-level `default_ref` is the global default for repositories that do
-not define their own value. For example, a global-only configuration is:
+Each `[[repos]]` entry requires a remote `url`. The repository name is derived
+from the final URL component with a trailing `.git` removed; that name is used
+for both the source clone and the feature-workspace worktree. `default_ref` is
+optional for each repository. When omitted, the tool uses unambiguous Git
+default-ref discovery.
 
-```toml
-default_ref = "main"
-
-[project]
-workspace_root = "../workspaces"
-
-[repos.app]
-path = "../repos/app"
-
-[repos.library]
-path = "../repos/library"
-```
-
-Per-repository values override the global value independently:
-
-```toml
-default_ref = "main"
-
-[project]
-workspace_root = "../workspaces"
-
-[repos.app]
-path = "../repos/app"
-default_ref = "develop"
-
-[repos.library]
-path = "../repos/library"
-
-[repos.tools]
-path = "../repos/tools"
-default_ref = "trunk"
-```
-
-Here `app` uses `develop`, `library` falls back to the global `main`, and
-`tools` uses `trunk`. Fully automatic behavior leaves both levels unset:
-
-```toml
-[project]
-workspace_root = "../workspaces"
-
-[repos.app]
-path = "../repos/app"
-
-[repos.library]
-path = "../repos/library"
-```
+Before creating a feature workspace, run `ws init` from the project root. It
+clones all configured URLs into `repos/`. The command refuses a pre-existing
+`repos/` directory, and if a later clone fails it removes the clone root and
+all clones created by that invocation while preserving `ws.toml` and unrelated
+files.
 
 Requirements:
 
-* repository identifiers such as `app` are logical names used by the CLI;
+* repository identifiers such as `app` are logical names derived from the URL
+  and used by the CLI;
 * workspace names and repository identifiers must match `[A-Za-z0-9][A-Za-z0-9._-]*`; reject empty names, `.`/`..` segments, separators, control characters, and leading dashes;
-* `path` points to an existing Git repository;
-* relative paths are resolved relative to the configuration file;
-* `workspace_root` controls where logical workspaces are created;
-* `default_ref` is optional at the global root and for each repository.
-  Only this key is accepted for default-ref configuration; other key names are
-  invalid and are not aliases or migration forms.
+* `url` is a non-empty remote Git URL;
+* `default_ref` is optional for each repository and, when supplied, must
+  resolve to a Git ref in that repository;
+* source clones are always created at `<project-root>/repos/<repository>`;
+* feature workspaces are always created at
+  `<project-root>/workspaces/<workspace>`;
+* only `url` and `default_ref` are accepted in a repository definition; other
+  keys are invalid and are not aliases or migration forms.
 
-`ws create <workspace>` and `ws remove <workspace>` use `./ws.toml` by
-default and accept `--config PATH`. They must not search upward for a config
-file. Workspace-local commands instead discover `.ws` upward from the current
-directory; the lock and state then identify the workspace without consulting
-the config. `remove` may therefore run inside the named workspace using
-discovery, or otherwise uses the explicitly selected/default config. No
-command globally scans the filesystem.
+`ws init` reads `./ws.toml` from the project root. `ws create <workspace>` and
+`ws remove <workspace>` use `./ws.toml` by default and accept `--config PATH`.
+They must not search upward for a config file. Workspace-local commands instead
+discover `.ws` upward from the current directory; the lock and state then
+identify the workspace without consulting the config. `remove` may therefore
+run inside the named workspace using discovery, or otherwise uses the
+explicitly selected/default config. No command globally scans the filesystem.
 
 Default-ref detection must be robust. Resolve and record each repository's
 effective default ref independently from the creation base/source ref. The
-effective-default precedence for each repository is, in order:
+effective-default choice for each repository is:
 
 1. the per-repository `default_ref`, if present;
-2. the global root-level `default_ref`, if present;
-3. existing automatic default-ref discovery, only if neither configuration
-   level supplied a value.
+2. automatic default-ref discovery when `default_ref` is omitted.
 
-Backward compatibility is explicit: when no global `default_ref` is present,
-any existing per-repository `default_ref` remains that repository's effective
-default. When neither the global nor repository level supplies `default_ref`,
-the pre-existing automatic discovery behavior is retained.
-
-An explicit value at either configuration level is authoritative for its
-repository. If it cannot be resolved there, report an affected-repository
-error and do not fall back to automatic discovery. A configured value is
-resolved with `git rev-parse --verify <value>^{commit}` and may be a branch,
-tag, remote-tracking ref, or full/abbreviated commit ID.
+An explicit per-repository value is authoritative. If it cannot be resolved,
+report an affected-repository error and do not fall back to automatic
+discovery. A configured value is resolved with `git rev-parse --verify
+<value>^{commit}` and may be a branch, tag, remote-tracking ref, or
+full/abbreviated commit ID.
 
 Prefer Git-native information such as:
 
@@ -247,12 +207,10 @@ git symbolic-ref refs/remotes/origin/HEAD
 
 where available.
 
-When neither configuration level supplied a value, use this exact automatic
-fallback order:
+When `default_ref` is omitted, use this exact automatic fallback order:
 
-1. a unique remote symbolic HEAD (for example `origin/HEAD`), but only when
-   neither configuration level supplied `default_ref`; fail if
-   remotes disagree;
+1. a unique remote symbolic HEAD (for example `origin/HEAD`); fail if remotes
+   disagree;
 2. the currently checked-out branch of a non-bare source repository;
 3. a clear error when no unambiguous branch exists.
 
@@ -271,9 +229,16 @@ the separately recorded default selector needed by workspace-local
 
 ### 4b. Source availability
 
-The configured `path` entries must be valid Git repository roots at the time
-`ws create` loads the configuration. The tool does not clone or set up
-repositories.
+`ws init` must be run from the project root before `ws create`. It validates
+the `[[repos]]` entries, creates `repos/`, and clones each configured URL into
+its derived repository directory. A pre-existing `repos/` is rejected before
+any clone starts. If a clone fails, initialization removes the clone root and
+all clones created by that invocation, preserving `ws.toml` and unrelated
+project files.
+
+`ws create` requires every configured source clone at
+`repos/<repository>` to be an initialized Git repository. Missing or invalid
+source clones are an error; source cloning is performed by `ws init`.
 
 If a source repository becomes unavailable after workspace creation (deletion,
 move, network loss), workspace-local commands (`ws status`, `ws claim`,
@@ -282,14 +247,10 @@ repository as unavailable. Mutation commands fail with a clear diagnostic
 referencing the repository name and the nature of the unavailability.
 Workspace removal preflights source availability before removing any worktree.
 
-**No automatic cloning.** Users are expected to clone or set up repositories
-before defining them in `ws.toml`.
-
 ### 4c. Default ref resolution details
 
-The selected configured `default_ref` value, when present at either the
-per-repository or global level, is resolved as a Git ref in the source
-repository at workspace creation time. It is stored as-is in the lock file's
+The selected configured per-repository `default_ref`, when present, is resolved
+as a Git ref in the source repository at workspace creation time. It is stored as-is in the lock file's
 `default_selector`. It is not required to be a branch name; any resolvable Git
 ref (branch, tag, remote-tracking ref, full/abbreviated commit ID) is
 acceptable, provided `git rev-parse --verify <value>^{commit}` succeeds in the
@@ -297,20 +258,30 @@ source repository. A configured value that fails this check is an
 authoritative error for that repository; it must not trigger discovery, and
 workspace creation fails.
 
-For multi-remote repositories without either configured `default_ref`,
+For multi-remote repositories without a configured `default_ref`,
 `_remote_symbolic_selector` considers **all** `refs/remotes/*/HEAD` entries. If
 exactly one distinct commit is reachable from all remote symbolic HEAD targets,
 the alphabetically smallest target branch name is selected (for determinism).
 If different commits are reachable, the tool errors with "remote symbolic
-HEADs disagree" rather than picking one. Automatic multi-remote discovery is
-skipped whenever either configuration level supplied a value. This means a
-repository with only an `origin` remote behaves predictably, while a repository
-with multiple remotes that point to different default refs fails predictably
-only in the fully automatic case.
+HEADs disagree" rather than picking one. A configured `default_ref` skips
+automatic discovery. This means a repository with only an `origin` remote
+behaves predictably, while a repository with multiple remotes that point to
+different default refs fails predictably only when `default_ref` is omitted.
 
 ---
 
 # 5. Workspace creation
+
+Bootstrap the project once before creating feature workspaces:
+
+```bash
+ws init
+ws create feature-name
+```
+
+`ws init` owns the source-clone setup in `<project-root>/repos/`. `ws create`
+uses those source clones and owns only the detached worktrees and metadata in
+`<project-root>/workspaces/<feature>/`.
 
 Implement:
 
@@ -320,13 +291,14 @@ ws create <workspace-name> [--config PATH]
 
 Creation also accepts `--config PATH`; the canonical default is `./ws.toml`.
 Validate the workspace name and every configured repository identifier before
-any source/worktree mutation; the external lifecycle-lock bookkeeping
-directory is the documented synchronization exception.
+any worktree mutation; the external lifecycle-lock bookkeeping directory is
+the documented synchronization exception. Validate that every source clone
+created by `ws init` is present and is a Git repository.
 
 The command should:
 
 1. load the project configuration;
-2. validate configured repositories;
+2. validate configured repository definitions and initialized source clones;
 3. derive the normal workspace target and deterministic tombstone paths;
 4. atomically acquire `<workspace-root>/.<workspace-name>.lifecycle.lock/`;
 5. check that the normal workspace target and deterministic
@@ -335,12 +307,12 @@ The command should:
    validate it with `git check-ref-format --branch`;
 7. determine the source ref for each repository;
 8. resolve every source ref and every effective default selector before
-   changing worktree/source content or metadata state (the lifecycle lock is
+   changing worktree content or metadata state (the lifecycle lock is
    synchronization bookkeeping as specified below);
 9. create:
 
 ```text
-<workspace_root>/<workspace-name>/
+<project-root>/workspaces/<workspace-name>/
 ├── repos/
 │   ├── app/
 │   ├── library/
@@ -354,22 +326,21 @@ The command should:
 11. every worktree must initially use detached HEAD;
 12. record the immutable creation information in `workspace.lock.toml`.
 
-The configured source Git directories must be canonicalized and unique.
-Reject a workspace root that equals or is nested under any canonical source
-repository, whether bare or non-bare. Submodules, if present, are untouched;
-do not automatically initialize or alter them. If the target workspace path
-or its deterministic `.removing/` tombstone already exists, fail before
-mutation: do not clean it up, reuse it, or repair it.
+The source clones under `<project-root>/repos/` are canonicalized and named by
+their configuration entries. Submodules in those source clones, if present,
+are untouched; do not automatically initialize or alter them. If the target
+feature-workspace path or its deterministic `.removing/` tombstone already
+exists, fail before mutation: do not clean it up, reuse it, or repair it.
 
 For every repository, resolve and lock the nullable default selector separately
 from the base/source ref when it is available, even when creation uses a source
-override or tag. A source override does not alter effective-default precedence:
-the repository's configured `default_ref`, then the global `default_ref`, then
-automatic discovery are still used for the locked selector. For a bare source
-without a configured selector or unambiguous automatic discovery, record a
-null selector (omit the optional TOML key); do not invent one. Creation must
-still succeed when every repository has an explicit source override, even if
-all default selectors are null.
+override or tag. A source override does not alter the repository's configured
+`default_ref`, or automatic discovery when `default_ref` is omitted, for the
+locked selector. For a bare source without a configured selector or
+unambiguous automatic discovery, record a null selector (omit the optional
+TOML key); do not invent one. Creation must still succeed when every
+repository has an explicit source override, even if all default selectors are
+null.
 
 Example conceptual lock data:
 

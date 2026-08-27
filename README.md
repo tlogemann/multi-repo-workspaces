@@ -16,63 +16,65 @@ A **workspace** is a named collection of repositories defined by a `ws.toml` fil
 
 ## Quick Start
 
+Install the tool and place a `ws.toml` in the project root:
+
 ```bash
-# Install
 pip install ws-tool
-
-# Create a workspace (all repos start detached)
-ws create my-workspace
-
-# Claim a repository into an isolated branch
-ws claim my-workspace/app
-
-# Work normally—changes are isolated in ws/my-workspace/app
 ```
+
+```toml
+[[repos]]
+url = "git@github.com:acme/api.git"
+default_ref = "main"
+```
+
+Initialize the source clones, then create a detached feature workspace:
+
+```bash
+ws init
+ws create feature-name
+```
+
+`ws init` clones each configured repository into `repos/`. `ws create` creates
+detached worktrees from those source clones under
+`workspaces/feature-name/repos/`. The source clones remain the reusable Git
+sources; feature worktrees are the isolated working copies.
+
+`ws init` refuses to run when `repos/` already exists. If any clone fails, it
+rolls back the clone root and clones created by that invocation, while
+preserving `ws.toml` and unrelated project files.
 
 ## ws.toml
 
-Place `ws.toml` in your project root:
+Each `[[repos]]` entry requires a remote `url`; its repository name is derived
+from the final URL component. `default_ref` is optional and selects the
+repository's default base ref. When it is omitted, Git's unambiguous default
+ref discovery is used. The selected default is locked when the feature
+workspace is created.
 
 ```toml
+[[repos]]
+url = "git@github.com:acme/api.git"
 default_ref = "main"
 
-[project]
-workspace_root = "../workspaces"
-
-[repos."app"]
-path = "../repos/app"
-
-[repos."library"]
-path = "../repos/library"
+[[repos]]
+url = "git@github.com:acme/library.git"
 default_ref = "develop"
-
-[repos."tools"]
-path = "../repos/tools"
 ```
 
-### default_ref hierarchy
-
-Each repository's effective default ref is resolved in this order:
-
-1. **Per-repository `default_ref`** (if set)
-2. **Global `default_ref`** (if set)
-3. **Automatic discovery** — remote symbolic HEAD or checked-out branch
-
-In the example above: `app` uses `main` (global), `library` uses `develop` (per-repo override), and `tools` uses `main` (global, no per-repo override).
-
-**Config is not searched upward.** Pass `--config PATH` explicitly if your `ws.toml` is not in the current directory.
-
-Configured `default_ref` values must resolve to a Git ref (branch, tag, remote-tracking ref, or commit). An unresolvable value fails workspace creation.
+**Config is not searched upward.** `ws init` reads `./ws.toml`; `ws create`
+and `ws remove` use it by default and accept `--config PATH`.
 
 ## Commands
 
 ### Create
 
 ```bash
-ws create feature-a
+ws create feature-name
 ```
 
-Creates a workspace with all repositories in detached HEAD state at their locked commits.
+Creates a feature workspace with all repositories in detached HEAD state at
+their locked commits. Run `ws init` first so the source clones exist.
 
 ### Different initial source
 
@@ -97,7 +99,7 @@ Claims the repository using the workspace's immutable locked base commit. The br
 ws claim app --source default
 ```
 
-Claims the repository using its current default branch (`main` or `master`) instead of the locked base.
+Claims the repository using its locked default selector instead of the locked creation base.
 
 ### Claim arbitrary source into arbitrary target
 
@@ -155,9 +157,9 @@ original working changes
 
 ## Naming rules
 
-**Workspace names** must match `[a-zA-Z][a-zA-Z0-9_-]*`.
+**Workspace names** must match `[A-Za-z0-9][A-Za-z0-9._-]*`.
 
-**Repository names** must match `[a-zA-Z][a-zA-Z0-9_-]*`.
+**Repository names** must match `[A-Za-z0-9][A-Za-z0-9._-]*`.
 
 These are enforced strictly. No spaces, no special characters.
 

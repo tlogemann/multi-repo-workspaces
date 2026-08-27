@@ -1937,7 +1937,8 @@ def status_workspace(start: Path | None = None) -> dict[str, Any]:
 def render_status_human(payload: dict[str, Any]) -> str:
     lines = [f"WORKSPACE {payload['workspace']}", ""]
     lines.append(
-        "repo       base             default          HEAD      mode      branch              dirty  context"
+        "repo       base             default          HEAD      mode      "
+        "branch              dirty  context"
     )
     lines.append("-" * 100)
     for name, repo in payload["repos"].items():

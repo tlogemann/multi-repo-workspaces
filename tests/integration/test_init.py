@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ws_tool.git import run_git
-
 from test_phase2 import run_ws
+
+from ws_tool.git import run_git
 
 
 def write_init_config(path: Path, entries: list[tuple[str, str]]) -> Path:
@@ -117,4 +117,7 @@ def test_create_uses_initialized_source_clone(tmp_path: Path, git_repo, bare_git
     assert result.returncode == 0, result.stderr
     worktree = tmp_path / "workspaces" / "feature" / "repos" / "api"
     assert worktree.is_dir()
-    assert run_git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=worktree, check=False).returncode != 0
+    result = run_git(
+        ["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=worktree, check=False
+    )
+    assert result.returncode != 0
