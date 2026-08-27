@@ -31,19 +31,38 @@ ws claim my-workspace/app
 
 ## ws.toml
 
-Place `ws.toml` in your workspace root:
+Place `ws.toml` in your project root:
 
 ```toml
-[workspace]
-name = "my-workspace"
-root = "."  # workspace root (default: ws.toml directory)
+default_ref = "main"
 
-[repos]
-app = "git@github.com:org/app.git"
-lib = "git@github.com:org/lib.git"
+[project]
+workspace_root = "../workspaces"
+
+[repos."app"]
+path = "../repos/app"
+
+[repos."library"]
+path = "../repos/library"
+default_ref = "develop"
+
+[repos."tools"]
+path = "../repos/tools"
 ```
 
+### default_ref hierarchy
+
+Each repository's effective default ref is resolved in this order:
+
+1. **Per-repository `default_ref`** (if set)
+2. **Global `default_ref`** (if set)
+3. **Automatic discovery** — remote symbolic HEAD or checked-out branch
+
+In the example above: `app` uses `main` (global), `library` uses `develop` (per-repo override), and `tools` uses `main` (global, no per-repo override).
+
 **Config is not searched upward.** Pass `--config PATH` explicitly if your `ws.toml` is not in the current directory.
+
+Configured `default_ref` values must resolve to a Git ref (branch, tag, remote-tracking ref, or commit). An unresolvable value fails workspace creation.
 
 ## Commands
 
@@ -142,9 +161,9 @@ original working changes
 
 These are enforced strictly. No spaces, no special characters.
 
-## Default branch locking
+## Default ref locking
 
-Each repository's default selector is locked independently at creation time. If you later delete `ws.toml` and recreate the workspace, the locked default is preserved. This means `default` still resolves correctly after config changes.
+Each repository's default ref is locked independently at creation time. If you later delete `ws.toml` and recreate the workspace, the locked default selector is preserved. This means `default` still resolves correctly after config changes.
 
 ## Operation locks
 
