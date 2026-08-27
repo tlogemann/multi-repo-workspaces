@@ -17,6 +17,7 @@ WORKSPACE_PHASES = frozenset({"idle"}) | REMOVAL_PHASES
 @dataclass(frozen=True)
 class RepoConfig:
     name: str
+    url: str
     source_path: Path
     default_ref: str | None = None
 

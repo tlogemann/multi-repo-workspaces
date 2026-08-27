@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 from .errors import ConfigError
-from .git import repository_kind
 from .models import ProjectConfig, RepoConfig
 from .validation import InvalidLogicalName
 from .validation import validate_logical_name as _validate_logical_name
@@ -17,6 +16,12 @@ def validate_logical_name(name: str, *, kind: str) -> str:
         return _validate_logical_name(name, kind=kind)
     except InvalidLogicalName as exc:
         raise ConfigError(str(exc)) from exc
+
+
+def derive_clone_name(url: str) -> str:
+    normalized = url.rstrip("/")
+    candidate = normalized.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+    return validate_logical_name(candidate.removesuffix(".git"), kind="repository")
 
 
 def parse_source_overrides(
@@ -64,52 +69,29 @@ def load_config(path: str | Path) -> ProjectConfig:
     except OSError as exc:
         raise ConfigError(f"cannot read configuration file {config_path}: {exc}") from exc
 
-    # Parse global default_ref if present
-    global_default_ref = _validate_default_ref(raw.get("default_ref"), "default_ref")
-
-    project = _mapping(raw.get("project"), "[project]")
-    workspace_root_value = project.get("workspace_root")
-    if not isinstance(workspace_root_value, str) or not workspace_root_value:
-        raise ConfigError("[project].workspace_root must be a non-empty string")
-    workspace_root = (config_path.parent / workspace_root_value).expanduser().resolve(strict=False)
-
-    raw_repos = _mapping(raw.get("repos"), "[repos]")
-    if not raw_repos:
-        raise ConfigError("configuration must define at least one [repos.<name>] entry")
+    raw_repos = raw.get("repos")
+    if not isinstance(raw_repos, list) or not raw_repos:
+        raise ConfigError("configuration must define at least one [[repos]] entry")
 
     repos: dict[str, RepoConfig] = {}
-    canonical_sources: dict[Path, str] = {}
-    for raw_name, raw_repo in raw_repos.items():
-        if not isinstance(raw_name, str):
-            raise ConfigError("repository identifier must be a string")
-        name = validate_logical_name(raw_name, kind="repository")
-        repo = _mapping(raw_repo, f"[repos.{name}]")
-        source_value = repo.get("path")
-        if not isinstance(source_value, str) or not source_value:
-            raise ConfigError(f"[repos.{name}].path must be a non-empty string")
-        source_path = (config_path.parent / source_value).expanduser().resolve(strict=False)
-        if repository_kind(source_path) is None:
-            raise ConfigError(f"repository path is not a Git repository root: {source_path}")
-
-        previous = canonical_sources.get(source_path)
+    for index, raw_repo in enumerate(raw_repos):
+        repo = _mapping(raw_repo, f"[[repos]] entry {index}")
+        url_value = repo.get("url")
+        url = _validate_url(url_value, f"[[repos]] entry {index}.url")
+        name = derive_clone_name(url)
+        previous = repos.get(name)
         if previous is not None:
             raise ConfigError(
-                f"duplicate canonical source path {source_path} for repositories "
-                f"{previous!r} and {name!r}"
-            )
-        canonical_sources[source_path] = name
-
-        default_ref = _validate_default_ref(repo.get("default_ref"), f"[repos.{name}].default_ref")
-        repos[name] = RepoConfig(name, source_path, default_ref)
-
-    for source_path in canonical_sources:
-        if workspace_root == source_path or source_path in workspace_root.parents:
-            raise ConfigError(
-                f"workspace_root {workspace_root} is equal to or nested under "
-                f"source repository {source_path}"
+                f"duplicate repository name {name!r} for URLs {previous.url!r} and {url!r}"
             )
 
-    return ProjectConfig(config_path, workspace_root, global_default_ref, repos)
+        default_ref = _validate_default_ref(
+            repo.get("default_ref"), f"[[repos]] entry {index}.default_ref"
+        )
+        source_path = config_path.parent / "repos" / name
+        repos[name] = RepoConfig(name, url, source_path, default_ref)
+
+    return ProjectConfig(config_path, config_path.parent / "workspaces", None, repos)
 
 
 def _mapping(value: Any, label: str) -> dict[str, Any]:
@@ -123,4 +105,10 @@ def _validate_default_ref(value: Any, label: str) -> str | None:
         return None
     if not isinstance(value, str) or not value or any(ord(c) < 32 or c == "\x7f" for c in value):
         raise ConfigError(f"{label} must be a non-empty ref string")
+    return value
+
+
+def _validate_url(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value or any(ord(c) < 32 or c == "\x7f" for c in value):
+        raise ConfigError(f"{label} must be a non-empty URL string")
     return value

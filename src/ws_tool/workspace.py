@@ -93,6 +93,12 @@ def create_workspace(
 ) -> WorkspacePaths:
     validate_logical_name(workspace_name, kind="workspace")
     project = load_config(Path("ws.toml") if config_path is None else config_path)
+    for name, repo in project.repos.items():
+        if repository_kind(repo.source_path) is None:
+            raise ConfigError(
+                f"repository {name!r} source is not initialized; expected initialized source clone "
+                f"at {repo.source_path}"
+            )
     overrides = parse_source_overrides(source_overrides, project.repos)
     paths = _paths(project.workspace_root, workspace_name)
     for repo_name in project.repos:
