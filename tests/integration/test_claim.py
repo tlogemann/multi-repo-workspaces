@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from test_phase2 import adopt_source, hydrate_source_refs, initialize_sources
+from test_phase2 import adopt_source, hydrate_source_refs, initialize_sources, prepare_remote
 from test_phase2 import repo_table as _repo_table
 
 from ws_tool.git import worktree_admin_path
@@ -33,10 +33,6 @@ def write_config(path: Path, workspace_root: str, repos: str) -> Path:
     return path
 
 
-def repo_table(name: str, source: Path, default_ref: str | None = None) -> str:
-    return _repo_table(name, source, default_ref)
-
-
 def git_output(cwd: Path, *args: str, check: bool = True) -> str:
     result = subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True, check=check)
     return result.stdout.strip()
@@ -49,7 +45,7 @@ def create_config(tmp_path: Path, source, *, default_ref: str | None = None) -> 
     config = write_config(
         config_dir / "ws.toml",
         "../workspaces",
-        repo_table("app", source_path, default_ref),
+        _repo_table("app", prepare_remote("app", source_path), default_ref),
     )
     initialize_sources(config_dir)
     if hasattr(source, "path"):

@@ -5,7 +5,7 @@ from collections.abc import Collection, Iterable
 from pathlib import Path
 from typing import Any
 
-from .errors import ConfigError
+from .errors import ConfigError, redact_sensitive_url
 from .models import ProjectConfig, RepoConfig
 from .validation import InvalidLogicalName
 from .validation import validate_logical_name as _validate_logical_name
@@ -19,9 +19,32 @@ def validate_logical_name(name: str, *, kind: str) -> str:
 
 
 def derive_clone_name(url: str) -> str:
-    normalized = url.rstrip("/")
-    candidate = normalized.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
-    return validate_logical_name(candidate.removesuffix(".git"), kind="repository")
+    if "://" in url:
+        from urllib.parse import urlsplit
+
+        path = urlsplit(url).path
+        candidate = path.rsplit("/", 1)[-1] if path and not path.endswith("/") else ""
+    else:
+        scp_path = _scp_path(url)
+        path = url if scp_path is None else scp_path
+        candidate = path.rsplit("/", 1)[-1] if path and not path.endswith("/") else ""
+    try:
+        return validate_logical_name(candidate.removesuffix(".git"), kind="repository")
+    except ConfigError as exc:
+        safe_url = redact_sensitive_url(url)
+        raise ConfigError(
+            f"cannot derive a usable repository name from URL {safe_url!r}"
+        ) from exc
+
+
+def _scp_path(url: str) -> str | None:
+    prefix, separator, path = url.partition(":")
+    if not separator or not prefix or "/" in prefix or any(char.isspace() for char in prefix):
+        return None
+    host = prefix.rsplit("@", 1)[-1]
+    if not host or "/" in host:
+        return None
+    return path
 
 
 def parse_source_overrides(
@@ -82,7 +105,8 @@ def load_config(path: str | Path) -> ProjectConfig:
         previous = repos.get(name)
         if previous is not None:
             raise ConfigError(
-                f"duplicate repository name {name!r} for URLs {previous.url!r} and {url!r}"
+                f"duplicate repository name {name!r} for URLs "
+                f"{redact_sensitive_url(previous.url)!r} and {redact_sensitive_url(url)!r}"
             )
 
         default_ref = _validate_default_ref(

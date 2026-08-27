@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_phase2 import adopt_source, hydrate_source_refs, initialize_sources
+from test_phase2 import adopt_source, hydrate_source_refs, initialize_sources, prepare_remote
 from test_phase2 import repo_table as _repo_table
 
 import ws_tool.workspace as workspace_module
@@ -40,13 +40,17 @@ def git_output(cwd: Path, *args: str, check: bool = True) -> str:
 
 
 def write_config(path: Path, source: Path, *, default_ref: str | None = None) -> Path:
-    path.write_text(_repo_table("app", source, default_ref), encoding="utf-8")
+    path.write_text(
+        _repo_table("app", prepare_remote("app", source), default_ref), encoding="utf-8"
+    )
     return path
 
 
 def write_two_repo_config(path: Path, app_source: Path, api_source: Path) -> Path:
     path.write_text(
-        _repo_table("app", app_source) + _repo_table("api", api_source), encoding="utf-8"
+        _repo_table("app", prepare_remote("app", app_source))
+        + _repo_table("api", prepare_remote("api", api_source)),
+        encoding="utf-8",
     )
     return path
 

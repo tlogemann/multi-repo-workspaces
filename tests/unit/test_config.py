@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from ws_tool.config import load_config, parse_source_overrides, validate_logical_name
+from ws_tool.config import (
+    derive_clone_name,
+    load_config,
+    parse_source_overrides,
+    validate_logical_name,
+)
 from ws_tool.errors import ConfigError
 
 
@@ -37,6 +42,33 @@ def test_loads_url_repositories_and_derives_source_paths(tmp_path: Path) -> None
     assert config.repos["web"].url == "git@example.test:acme/web.git"
     assert config.repos["web"].source_path == config_dir / "repos" / "web"
     assert config.repos["web"].default_ref == "develop"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("ssh://git@example.test/acme/repo.git", "repo"),
+        ("git@example.test:acme/repo.git", "repo"),
+        ("example.test:repo.git", "repo"),
+    ],
+)
+def test_derives_clone_name_from_url_or_scp_path_without_truncating_components(
+    url: str, expected: str
+) -> None:
+    assert derive_clone_name(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url", ["https://example.test", "https://example.test/", "git@example.test:"]
+)
+def test_rejects_url_without_usable_final_path_component(url: str) -> None:
+    with pytest.raises(ConfigError, match="repository"):
+        derive_clone_name(url)
+
+
+def test_rejects_colon_in_standard_url_path_instead_of_truncating_it() -> None:
+    with pytest.raises(ConfigError, match="repository"):
+        derive_clone_name("https://example.test/acme/repo:name.git")
 
 
 @pytest.mark.parametrize("repos", ["[[repos]]\n", '[[repos]]\nurl = ""\n'])
@@ -72,7 +104,7 @@ def test_rejects_duplicate_derived_names_with_conflicting_urls(tmp_path: Path) -
     second = "git@example.test:other/app.git"
     config_path = write_config(tmp_path / "ws.toml", repo_entry(first) + repo_entry(second))
 
-    with pytest.raises(ConfigError, match=f"{first}.*{second}"):
+    with pytest.raises(ConfigError, match=rf"{first}.*\[REDACTED\]@example.test:other/app.git"):
         load_config(config_path)
 
 

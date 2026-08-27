@@ -234,11 +234,13 @@ the separately recorded default selector needed by workspace-local
 ### 4b. Source availability
 
 `ws init` must be run from the project root before `ws create`. It validates
-the `[[repos]]` entries, creates `repos/`, and clones each configured URL into
-its derived repository directory. A pre-existing `repos/` is rejected before
-any clone starts. If a clone fails, initialization removes the clone root and
-all clones created by that invocation, preserving `ws.toml` and unrelated
-project files.
+the `[[repos]]` entries, clones each configured URL into an owned temporary
+sibling of `repos/`, and atomically renames that completed root to `repos/`
+only after all clones succeed. A pre-existing `repos/` is rejected before any
+clone starts. If a clone fails, initialization removes only its temporary clone
+root, preserving `ws.toml` and unrelated project files. Consequently,
+`ws create` observes either no source root or the complete published source
+root, never partial clones.
 
 `ws create` requires every configured source clone at
 `repos/<repository>` to be an initialized Git repository. Missing or invalid
@@ -355,13 +357,13 @@ Example conceptual lock data:
 name = "feature-x"
 
 [repos.app]
-source_path = "/absolute/path/to/app"
+source_path = "/absolute/path/to/project/repos/app"
 base_ref = "origin/main"
 base_commit = "4a72..."
 default_selector = "origin/main"
 
 [repos.library]
-source_path = "/absolute/path/to/library"
+source_path = "/absolute/path/to/project/repos/library"
 base_ref = "origin/develop"
 base_commit = "cc18..."
 # default_selector omitted: null
@@ -375,7 +377,7 @@ The schema may differ, but preserve these concepts:
 * nullable resolved default selector, independent of `base_ref`;
 * repository logical name;
 * a schema version;
-* absolute canonical source paths.
+* absolute canonical source-clone paths.
 
 The workspace lock is self-contained and remains authoritative after
 `ws.toml` is moved or deleted. Workspace-local commands use the lock and
@@ -1502,29 +1504,23 @@ Test that:
   control characters, leading dashes, and characters outside
   `[A-Za-z0-9][A-Za-z0-9._-]*`;
 * an existing target path fails without cleanup, reuse, or repair;
-* canonical source paths are unique and a workspace root equal to or nested
-  under either a bare or non-bare source is rejected;
+* derived clone names are unique, source clones are fixed below the project
+  `repos/` root, and feature workspaces are fixed below `workspaces/`;
+* `ws init` publishes all source clones atomically and rolls back only its
+  owned temporary clone root after a failed clone;
 * submodules are not initialized or changed;
 * a bare source is supported, while automatic fallback does not use a
   checked-out branch and records a nullable selector;
-* global root-level `default_ref` is parsed, per-repository `default_ref`
-  overrides it, and a repository with neither value uses automatic discovery;
-* with no global `default_ref`, existing per-repository `default_ref` values
-  remain effective defaults, while configurations with neither level preserve
-  the pre-existing automatic discovery behavior;
-* global-only configuration resolves the same configured value independently
-  for every repository that lacks an override, with at least three repositories
-  demonstrating per-repository fallback;
-* fully automatic configurations (neither global nor per-repository
-  `default_ref`) preserve the existing automatic discovery behavior;
+* each repository's `default_ref`, when present, is authoritative; when it is
+  omitted, automatic discovery is used independently for that repository;
 * configured branches, tags, remote-tracking refs, full commit IDs, and
   abbreviated commit IDs all resolve through the required commit verification;
 * an unavailable configured ref remains authoritative for the default selector
   and never falls back to automatic discovery; creation fails without an
   explicit source override for that repository, but succeeds with one and
   records a null selector;
-* automatic multi-remote discovery is skipped when either configuration level
-  supplied `default_ref`, including when remote symbolic HEADs disagree;
+* automatic multi-remote discovery is skipped when a repository supplies
+  `default_ref`, including when remote symbolic HEADs disagree;
 * automatic fallback uses one consistent remote symbolic HEAD, then a non-bare
   checked-out branch, and rejects disagreement or ambiguity without guessing;
 * every repository lock records a nullable default selector independently of
@@ -1582,10 +1578,10 @@ workspace-local `ws claim repo-a --source default` and
 the creation base. Repeat with a bare repository and an explicit default
 selector.
 
-Repeat the claim setup with a global-only `default_ref` and with a
-per-repository override over that global value. Verify the selected and locked
-selectors are the effective per-repository values, and that a source override
-or tag does not change this precedence.
+Repeat the claim setup with per-repository `default_ref` values and with an
+omitted value that uses automatic discovery. Verify the selected and locked
+selectors are independent per-repository values, and that a source override or
+tag does not change this choice.
 
 ## Explicit source
 
@@ -1824,9 +1820,9 @@ ws context repo-a default
 Verify that `default` resolves the current commit selected by the locked default
 selector rather than the workspace's locked base.
 
-Run this with a per-repository configured value, a global-only configured value,
-and a fully automatic repository. Verify each context operation uses the
-appropriate locked selector, and that a source override does not replace it.
+Run this with a per-repository configured value and a fully automatic
+repository. Verify each context operation uses the appropriate locked
+selector, and that a source override does not replace it.
 
 ---
 
@@ -2066,13 +2062,13 @@ Add focused unit tests where useful for:
 * deterministic tombstone path and `removal_complete` serialization;
 * context-state representation;
 * default-selector lock serialization independent of base/source refs;
-* global/per-repository `default_ref` parsing and precedence;
+* per-repository `default_ref` parsing and automatic-discovery selection;
 * configured branch, tag, remote-tracking, full-ID, and abbreviated-ID
   resolution, including authoritative unavailable-ref errors;
 * return-branch/saved-HEAD validation;
 * strict workspace/repository identifier and `repo=ref` parsing;
-* default-ref precedence, fallback, and remote-HEAD disagreement;
-* canonical source/root safety checks;
+* per-repository default-ref selection, fallback, and remote-HEAD disagreement;
+* derived source-clone paths and fixed project-root locations;
 * atomic metadata writes and schema-version validation;
 * write-ahead transition intent/outcome and stash-token serialization;
 * OID-pinned private stash refs and shared-entry retention;
@@ -2222,9 +2218,8 @@ Also document:
 
 * `ws.toml`/`--config PATH` behavior and the fact that config is not searched
   upward;
-* the root-level and per-repository `default_ref` configuration, with
-  per-repository values overriding the global value and automatic discovery
-  used only when neither is configured;
+* per-repository `default_ref` configuration, with automatic discovery used
+  only when that repository omits the value;
 * configured default refs may be branches, tags, remote-tracking refs, or
   full/abbreviated commit IDs; an unavailable configured value is retained as
   a null selector rather than falling back to discovery, and an explicit
@@ -2286,7 +2281,7 @@ Implement:
 * project/package structure;
 * models;
 * `ws.toml` configuration and explicit config selection;
-* parsing and precedence for global and per-repository `default_ref` values;
+* parsing of per-repository `default_ref` values and automatic discovery;
 * strict identifier/source-override validation;
 * schema-versioned lock/state models and atomic metadata writes;
 * Git subprocess layer;
@@ -2302,14 +2297,15 @@ Fix all failures.
 Implement:
 
 * default source resolution;
-* exact nullable default-ref precedence and fallback order, including bare sources;
+* exact nullable per-repository default-ref selection and fallback order,
+  including bare sources;
 * commit-verifying configured refs, authoritative unavailable-ref failures, and
-  skipping automatic multi-remote discovery whenever configuration supplies a
+  skipping automatic multi-remote discovery whenever a repository supplies a
   value;
 * independent default-selector locking;
 * explicit `--source repo=ref`;
 * immutable ref resolution;
-* canonical source/root safety validation;
+* derived source-clone paths and fixed project-root locations;
 * detached worktrees;
 * lock file;
 * external lifecycle locking and existing-target/tombstone refusal;
@@ -2418,9 +2414,10 @@ Review the complete implementation for:
 * operation-lock and manual stale-lock recovery behavior;
 * external/internal lifecycle-lock ordering, lifetime, and manual recovery of
   both exact stale locks;
-* strict names, source parsing, default resolution, and workspace-root safety;
-* global/per-repository default-ref precedence, configured-ref validation,
-  automatic-discovery gating, and lock-based status behavior;
+* strict names, source parsing, default resolution, and fixed project-root
+  locations;
+* per-repository default-ref validation, automatic-discovery gating, and
+  lock-based status behavior;
 * complete removal preflight and durable rerunnable progress;
 * deterministic tombstone rename/deletion and crash recovery;
 * stale worktree registrations;
@@ -2581,8 +2578,8 @@ branch or deleting state/stash.
 
 ### Invariant 17
 
-The workspace root is never equal to or nested under any canonical source
-repository, bare or non-bare.
+Source clones are published only below the project `repos/` root, and feature
+workspaces are created only below the project `workspaces/` root.
 
 ### Invariant 18
 
@@ -2660,11 +2657,11 @@ At completion provide:
 6. `--finalize-restore`, phase, and manual recovery semantics;
 7. `restore_conflicted` versus `restore_failed` behavior and write-ahead
    recovery records;
-8. exact configured/effective/auto-discovered default-ref precedence, selector lock,
+8. exact per-repository configured/auto-discovered default-ref selection, selector lock,
    config-deletion, and authoritative configured-ref error semantics;
 9. explanation of OID-pinned stash safety, shared-entry retention, and
    return-branch identity checks;
-10. source-root containment, removal-precedence, deterministic tombstone
+10. fixed source/workspace roots, removal precedence, deterministic tombstone
      recovery, and durable removal progress;
 11. external/internal lifecycle-lock ordering, lifetime, and manual crash
     recovery of both exact stale locks;

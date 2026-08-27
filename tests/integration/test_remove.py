@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_phase2 import adopt_source, initialize_sources, repo_table
+from test_phase2 import adopt_source, initialize_sources, prepare_remote, repo_table
 
 import ws_tool.workspace as workspace_module
 from ws_tool.errors import GitCommandError, WsError
@@ -45,7 +45,9 @@ def git_output(cwd: Path, *args: str, check: bool = True) -> str:
 
 
 def write_config(path: Path, workspace_root: Path, sources: dict[str, Path]) -> Path:
-    repos = "\n".join(repo_table(name, source) for name, source in sources.items())
+    repos = "\n".join(
+        repo_table(name, prepare_remote(name, source)) for name, source in sources.items()
+    )
     path.write_text(repos, encoding="utf-8")
     return path
 

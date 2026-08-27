@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import tempfile
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -93,21 +94,34 @@ def init_workspace(*, cwd: Path | None = None) -> Path:
     clone_root = root / "repos"
     if clone_root.exists() or clone_root.is_symlink():
         raise WsError(f"source clone root already exists: {clone_root}")
+    publication_lock = root / ".repos.init.lock"
+    try:
+        publication_lock.mkdir()
+    except FileExistsError as exc:
+        raise WsError(f"source initialization lock already exists: {publication_lock}") from exc
+    temporary_root: Path | None = None
     for repo in project.repos.values():
         expected_source = (clone_root / repo.name).resolve(strict=False)
         if repo.source_path.resolve(strict=False) != expected_source:
+            publication_lock.rmdir()
             raise WsError(
                 f"repository {repo.name!r} source path is not under the workspace clone root: "
                 f"{repo.source_path}"
             )
-    clone_root.mkdir()
     try:
+        temporary_root = Path(tempfile.mkdtemp(prefix=".repos.init-", dir=root))
         for repo in project.repos.values():
-            clone_repository(repo.url, repo.source_path)
-    except BaseException:
-        shutil.rmtree(clone_root)
-        raise
-    return clone_root
+            clone_repository(repo.url, temporary_root / repo.name)
+        if clone_root.exists() or clone_root.is_symlink():
+            raise WsError(f"source clone root appeared during initialization: {clone_root}")
+        temporary_root.rename(clone_root)
+        temporary_root = None
+        return clone_root
+    finally:
+        if temporary_root is not None and temporary_root.exists():
+            shutil.rmtree(temporary_root)
+        if publication_lock.exists():
+            publication_lock.rmdir()
 
 
 def create_workspace(

@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from test_phase2 import adopt_source, initialize_sources, repo_table
+from test_phase2 import adopt_source, initialize_sources, prepare_remote, repo_table
 
 from conftest import (
     release_boundary,
@@ -36,7 +36,7 @@ def git_output(cwd: Path, *args: str) -> str:
 
 
 def write_config(path: Path, workspace_root: Path, source: Path) -> Path:
-    path.write_text(repo_table("app", source), encoding="utf-8")
+    path.write_text(repo_table("app", prepare_remote("app", source)), encoding="utf-8")
     return path
 
 

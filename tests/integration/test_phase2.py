@@ -32,13 +32,12 @@ def run_ws(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def write_config(path: Path, workspace_root: str, repos: str) -> Path:
+def write_config(path: Path, repos: str) -> Path:
     path.write_text(repos, encoding="utf-8")
     return path
 
 
-def repo_table(name: str, source: Path, default_ref: str | None = None) -> str:
-    default = "" if default_ref is None else f'\ndefault_ref = "{default_ref}"'
+def prepare_remote(name: str, source: Path) -> Path:
     url = (
         source
         if source.name.endswith(".git") and source.name.removesuffix(".git") == name
@@ -54,6 +53,11 @@ def repo_table(name: str, source: Path, default_ref: str | None = None) -> str:
                 capture_output=True,
             )
             assert cloned.returncode == 0, cloned.stderr
+    return url
+
+
+def repo_table(name: str, url: Path | str, default_ref: str | None = None) -> str:
+    default = "" if default_ref is None else f'\ndefault_ref = "{default_ref}"'
     return f'[[repos]]\nurl = "{url}"{default}\n'
 
 
@@ -162,8 +166,8 @@ def test_create_multi_repo_and_status_from_nested_directory(tmp_path: Path, git_
     config_dir.mkdir()
     config = write_config(
         config_dir / "ws.toml",
-        '"../workspaces"',
-        repo_table("app", app.path) + repo_table("library", library.path),
+        repo_table("app", prepare_remote("app", app.path))
+        + repo_table("library", prepare_remote("library", library.path)),
     )
     initialize_sources(config_dir)
     hydrate_source_refs(config_dir / "repos" / "app")
@@ -229,10 +233,9 @@ def test_create_source_override_branch_tag_and_sha(tmp_path: Path, git_repo) -> 
     config_dir.mkdir()
     config = write_config(
         config_dir / "ws.toml",
-        '"../workspaces"',
-        repo_table("branch", branch_source.path)
-        + repo_table("tag", tag_source.path)
-        + repo_table("sha", sha_source.path),
+        repo_table("branch", prepare_remote("branch", branch_source.path))
+        + repo_table("tag", prepare_remote("tag", tag_source.path))
+        + repo_table("sha", prepare_remote("sha", sha_source.path)),
     )
     initialize_sources(config_dir)
     hydrate_source_refs(config_dir / "repos" / "branch")
@@ -279,7 +282,9 @@ def test_status_rejects_renamed_workspace_with_authoritative_lock_name(
     source = git_repo("rename-source")
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+    config = write_config(
+        config_dir / "ws.toml", repo_table("app", prepare_remote("app", source.path))
+    )
     initialize_sources(config_dir)
     adopt_source(source, config_dir, "app")
     assert run_ws(config_dir, "create", "original", "--config", str(config)).returncode == 0
@@ -300,7 +305,9 @@ def test_status_rejects_copied_metadata_without_registered_worktrees(
     source = git_repo("copied-source")
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+    config = write_config(
+        config_dir / "ws.toml", repo_table("app", prepare_remote("app", source.path))
+    )
     initialize_sources(config_dir)
     adopt_source(source, config_dir, "app")
     assert run_ws(config_dir, "create", "source", "--config", str(config)).returncode == 0
@@ -330,8 +337,7 @@ def test_create_bare_source_with_explicit_override_records_null_default(
     config_dir.mkdir()
     config = write_config(
         config_dir / "ws.toml",
-        '"../workspaces"',
-        repo_table("bare", bare),
+        repo_table("bare", prepare_remote("bare", bare)),
     )
     initialize_sources(config_dir)
     subprocess.run(
@@ -371,8 +377,7 @@ def test_explicit_source_allows_missing_default_selector(tmp_path: Path, git_rep
     config_dir.mkdir()
     config = write_config(
         config_dir / "ws.toml",
-        '"../workspaces"',
-        repo_table("app", source.path, "missing/default"),
+        repo_table("app", prepare_remote("app", source.path), "missing/default"),
     )
     initialize_sources(config_dir)
 
@@ -408,7 +413,7 @@ def test_explicit_source_allows_ambiguous_remote_defaults_in_bare_source(
     seed.run("--git-dir", str(bare), "symbolic-ref", "HEAD", "refs/heads/main")
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", bare))
+    config = write_config(config_dir / "ws.toml", repo_table("app", prepare_remote("app", bare)))
     initialize_sources(config_dir)
     subprocess.run(
         ["git", "switch", "--detach", "HEAD"],
@@ -478,7 +483,7 @@ def test_create_rejects_same_named_remote_heads_at_different_commits(
     )
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", origin))
+    config = write_config(config_dir / "ws.toml", repo_table("app", prepare_remote("app", origin)))
     initialize_sources(config_dir)
     copy_remote_metadata(source.path, config_dir / "repos" / "app")
 
@@ -510,7 +515,7 @@ def test_create_accepts_differently_named_remote_heads_at_same_commit(
     )
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", origin))
+    config = write_config(config_dir / "ws.toml", repo_table("app", prepare_remote("app", origin)))
     initialize_sources(config_dir)
     copy_remote_metadata(source.path, config_dir / "repos" / "app")
 
@@ -540,7 +545,7 @@ def test_create_rejects_unresolvable_remote_symbolic_head(
     )
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", remote))
+    config = write_config(config_dir / "ws.toml", repo_table("app", prepare_remote("app", remote)))
     initialize_sources(config_dir)
     initialized = config_dir / "repos" / "app"
     subprocess.run(["git", "update-ref", remote_symbolic, tree_oid], cwd=initialized, check=True)
@@ -563,8 +568,7 @@ def test_create_rejects_existing_target_and_lifecycle_lock_without_cleanup(
     config_dir.mkdir()
     config = write_config(
         config_dir / "ws.toml",
-        '"../workspaces"',
-        repo_table("app", source.path),
+        repo_table("app", prepare_remote("app", source.path)),
     )
     initialize_sources(config_dir)
     adopt_source(source, config_dir, "app")
@@ -584,8 +588,7 @@ def test_create_uses_only_canonical_cwd_config_by_default(tmp_path: Path, git_re
     source = git_repo("source")
     write_config(
         tmp_path / "ws.toml",
-        '"workspaces"',
-        repo_table("app", source.path),
+        repo_table("app", prepare_remote("app", source.path)),
     )
     initialize_sources(tmp_path)
     source = initialized_source(tmp_path, "app")
@@ -611,8 +614,8 @@ def test_create_rolls_back_real_worktrees_after_injected_second_add_failure(
     config_dir.mkdir()
     config = write_config(
         config_dir / "ws.toml",
-        '"../workspaces"',
-        repo_table("first", first.path) + repo_table("second", second.path),
+        repo_table("first", prepare_remote("first", first.path))
+        + repo_table("second", prepare_remote("second", second.path)),
     )
     initialize_sources(config_dir)
     adopt_source(first, config_dir, "first")
@@ -650,8 +653,8 @@ def test_create_retains_lifecycle_lock_on_unexpected_identity_cleanup_failure(
     config_dir.mkdir()
     config = write_config(
         config_dir / "ws.toml",
-        '"../workspaces"',
-        repo_table("first", first.path) + repo_table("second", second.path),
+        repo_table("first", prepare_remote("first", first.path))
+        + repo_table("second", prepare_remote("second", second.path)),
     )
     initialize_sources(config_dir)
     adopt_source(first, config_dir, "first")
@@ -697,8 +700,8 @@ def test_sigint_during_creation_reraises_after_verified_rollback(
     config_dir.mkdir()
     config = write_config(
         config_dir / "ws.toml",
-        '"../workspaces"',
-        repo_table("first", first.path) + repo_table("second", second.path),
+        repo_table("first", prepare_remote("first", first.path))
+        + repo_table("second", prepare_remote("second", second.path)),
     )
     initialize_sources(config_dir)
     adopt_source(first, config_dir, "first")
@@ -739,8 +742,8 @@ def test_sigint_with_ordinary_cleanup_failure_reraises_original_interrupt(
     config_dir.mkdir()
     config = write_config(
         config_dir / "ws.toml",
-        '"../workspaces"',
-        repo_table("first", first.path) + repo_table("second", second.path),
+        repo_table("first", prepare_remote("first", first.path))
+        + repo_table("second", prepare_remote("second", second.path)),
     )
     initialize_sources(config_dir)
     adopt_source(first, config_dir, "first")
@@ -787,8 +790,8 @@ def test_sigint_during_cleanup_retains_both_creation_locks(
     config_dir.mkdir()
     config = write_config(
         config_dir / "ws.toml",
-        '"../workspaces"',
-        repo_table("first", first.path) + repo_table("second", second.path),
+        repo_table("first", prepare_remote("first", first.path))
+        + repo_table("second", prepare_remote("second", second.path)),
     )
     initialize_sources(config_dir)
     adopt_source(first, config_dir, "first")
@@ -829,7 +832,9 @@ def test_create_holds_both_locks_until_successful_completion(
     source = git_repo("lock-source")
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+    config = write_config(
+        config_dir / "ws.toml", repo_table("app", prepare_remote("app", source.path))
+    )
     initialize_sources(config_dir)
     adopt_source(source, config_dir, "app")
     workspace_root = config_dir / "workspaces"
@@ -854,7 +859,9 @@ def test_create_rejects_dangling_removal_tombstone_symlink(tmp_path: Path, git_r
     source = git_repo("dangling-tombstone-source")
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+    config = write_config(
+        config_dir / "ws.toml", repo_table("app", prepare_remote("app", source.path))
+    )
     initialize_sources(config_dir)
     adopt_source(source, config_dir, "app")
     workspace_root = config_dir / "workspaces"
@@ -879,8 +886,8 @@ def test_failed_cleanup_retains_dirty_worktree_and_lifecycle_lock(
     config_dir.mkdir()
     config = write_config(
         config_dir / "ws.toml",
-        '"../workspaces"',
-        repo_table("first", first.path) + repo_table("second", second.path),
+        repo_table("first", prepare_remote("first", first.path))
+        + repo_table("second", prepare_remote("second", second.path)),
     )
     initialize_sources(config_dir)
     adopt_source(first, config_dir, "first")
@@ -913,7 +920,9 @@ def test_status_reports_durable_context_mode_and_phase(tmp_path: Path, git_repo)
     source = git_repo("context-status")
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+    config = write_config(
+        config_dir / "ws.toml", repo_table("app", prepare_remote("app", source.path))
+    )
     initialize_sources(config_dir)
     adopt_source(source, config_dir, "app")
     assert run_ws(config_dir, "create", "context-status", "--config", str(config)).returncode == 0
@@ -960,8 +969,8 @@ def test_status_reports_partial_removal_after_completed_worktree_is_removed(
     config_dir.mkdir()
     config = write_config(
         config_dir / "ws.toml",
-        '"../workspaces"',
-        repo_table("first", first.path) + repo_table("second", second.path),
+        repo_table("first", prepare_remote("first", first.path))
+        + repo_table("second", prepare_remote("second", second.path)),
     )
     initialize_sources(config_dir)
     adopt_source(first, config_dir, "first")

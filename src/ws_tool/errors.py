@@ -1,6 +1,19 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
+
+_STANDARD_URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s?#@]+@")
+_SCP_URL_USERINFO = re.compile(r"(?<![\w/@])[^/\s:@]+@([^/\s:]+):")
+_URL_QUERY_VALUE = re.compile(r"([?&][^=\s&#]+)=([^&#\s]*)")
+
+
+def redact_sensitive_url(value: str) -> str:
+    """Remove URL credentials and query values before exposing diagnostics."""
+
+    redacted = _STANDARD_URL_USERINFO.sub(r"\1", value)
+    redacted = _SCP_URL_USERINFO.sub(r"[REDACTED]@\1:", redacted)
+    return _URL_QUERY_VALUE.sub(r"\1[REDACTED]", redacted)
 
 
 class WsError(Exception):
@@ -26,14 +39,14 @@ class GitCommandError(WsError):
         stdout: str,
         stderr: str,
     ) -> None:
-        self.args_list = args
+        self.args_list = tuple(redact_sensitive_url(arg) for arg in args)
         self.cwd = cwd
         self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
-        command = " ".join(["git", *args])
+        self.stdout = redact_sensitive_url(stdout)
+        self.stderr = redact_sensitive_url(stderr)
+        command = " ".join(["git", *self.args_list])
         location = f" in {cwd}" if cwd is not None else ""
-        detail = stderr.strip() or stdout.strip() or "no output"
+        detail = self.stderr.strip() or self.stdout.strip() or "no output"
         super().__init__(f"Git command failed{location}: {command} (exit {returncode}): {detail}")
 
 
