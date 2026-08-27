@@ -50,7 +50,9 @@ Each `[[repos]]` entry requires a remote `url`; its repository name is derived
 from the final URL component. `default_ref` is optional and selects the
 repository's default base ref. When it is omitted, Git's unambiguous default
 ref discovery is used. The selected default is locked when the feature
-workspace is created.
+workspace is created. If a configured default ref cannot be resolved, provide
+`--source repo=ref` to create the workspace with a null locked default
+selector.
 
 ```toml
 [[repos]]

@@ -170,13 +170,15 @@ Requirements:
   and used by the CLI;
 * workspace names and repository identifiers must match `[A-Za-z0-9][A-Za-z0-9._-]*`; reject empty names, `.`/`..` segments, separators, control characters, and leading dashes;
 * `url` is a non-empty remote Git URL;
-* `default_ref` is optional for each repository and, when supplied, must
-  resolve to a Git ref in that repository;
+* `default_ref` is optional for each repository and, when supplied, is
+  authoritative for its default selector; an unresolvable value records a null
+  selector and requires an explicit source override for creation;
 * source clones are always created at `<project-root>/repos/<repository>`;
 * feature workspaces are always created at
   `<project-root>/workspaces/<workspace>`;
-* only `url` and `default_ref` are accepted in a repository definition; other
-  keys are invalid and are not aliases or migration forms.
+* `url` and `default_ref` are the recognized repository-definition keys; other
+  keys are ignored by the configuration loader and are not aliases or
+  migration forms.
 
 `ws init` reads `./ws.toml` from the project root. `ws create <workspace>` and
 `ws remove <workspace>` use `./ws.toml` by default and accept `--config PATH`.
@@ -193,11 +195,13 @@ effective-default choice for each repository is:
 1. the per-repository `default_ref`, if present;
 2. automatic default-ref discovery when `default_ref` is omitted.
 
-An explicit per-repository value is authoritative. If it cannot be resolved,
-report an affected-repository error and do not fall back to automatic
-discovery. A configured value is resolved with `git rev-parse --verify
-<value>^{commit}` and may be a branch, tag, remote-tracking ref, or
-full/abbreviated commit ID.
+An explicit per-repository value is authoritative for the default selector. If
+it cannot be resolved, retain a null default selector and do not fall back to
+automatic discovery. A configured value is resolved with `git rev-parse
+--verify <value>^{commit}` and may be a branch, tag, remote-tracking ref, or
+full/abbreviated commit ID. Creation fails when that repository has no other
+resolvable base source; an explicit `--source repo=ref` supplies that base and
+allows creation to succeed with the null default selector.
 
 Prefer Git-native information such as:
 
@@ -254,9 +258,11 @@ as a Git ref in the source repository at workspace creation time. It is stored a
 `default_selector`. It is not required to be a branch name; any resolvable Git
 ref (branch, tag, remote-tracking ref, full/abbreviated commit ID) is
 acceptable, provided `git rev-parse --verify <value>^{commit}` succeeds in the
-source repository. A configured value that fails this check is an
-authoritative error for that repository; it must not trigger discovery, and
-workspace creation fails.
+source repository. If this check fails, the value remains authoritative for
+the default selector and must not trigger discovery. Without an explicit
+`--source repo=ref`, creation fails because the repository has no resolvable
+base source; with that override, creation succeeds and the lock records a
+null `default_selector`.
 
 For multi-remote repositories without a configured `default_ref`,
 `_remote_symbolic_selector` considers **all** `refs/remotes/*/HEAD` entries. If
@@ -414,10 +420,11 @@ Parse every `repo=ref` strictly before resolving refs or mutating anything:
 reject malformed pairs, unknown repository names, empty refs, and duplicate
 overrides. Resolve all validated overrides before worktree creation.
 
-Others use their independently resolved and locked effective default selector;
-source overrides do not change that precedence. If it is
-null, creation fails clearly because that repository has no explicit base
-source.
+Repositories without a source override use their independently resolved and
+locked effective default selector; if it is null, creation fails clearly
+because that repository has no explicit base source. A repository with an
+explicit `--source repo=ref` uses that ref as its base even when its locked
+default selector is null.
 
 The requested source ref and immutable SHA must both be recorded.
 
@@ -1512,8 +1519,10 @@ Test that:
   `default_ref`) preserve the existing automatic discovery behavior;
 * configured branches, tags, remote-tracking refs, full commit IDs, and
   abbreviated commit IDs all resolve through the required commit verification;
-* an unavailable configured ref fails workspace creation for its affected
-  repository and never falls back to automatic discovery;
+* an unavailable configured ref remains authoritative for the default selector
+  and never falls back to automatic discovery; creation fails without an
+  explicit source override for that repository, but succeeds with one and
+  records a null selector;
 * automatic multi-remote discovery is skipped when either configuration level
   supplied `default_ref`, including when remote symbolic HEADs disagree;
 * automatic fallback uses one consistent remote symbolic HEAD, then a non-bare
@@ -2217,8 +2226,9 @@ Also document:
   per-repository values overriding the global value and automatic discovery
   used only when neither is configured;
 * configured default refs may be branches, tags, remote-tracking refs, or
-  full/abbreviated commit IDs, and an unavailable configured value is an
-  authoritative create error rather than a discovery fallback;
+  full/abbreviated commit IDs; an unavailable configured value is retained as
+  a null selector rather than falling back to discovery, and an explicit
+  source override can still provide the creation base;
 * strict workspace and repository naming rules;
 * automatic claim branches as `ws/<workspace-name>/<repo-name>` and their
   collision/idempotency rules;
