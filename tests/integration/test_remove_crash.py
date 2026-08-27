@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import signal
 import subprocess
@@ -9,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from test_phase2 import adopt_source, initialize_sources, repo_table
 from ws_tool.serialization import deserialize_removal_seal, deserialize_workspace_state
 
 
@@ -37,23 +37,21 @@ def git_output(cwd: Path, *args: str) -> str:
 
 
 def write_config(path: Path, workspace_root: Path, source: Path) -> Path:
-    path.write_text(
-        "[project]\n"
-        f"workspace_root = {json.dumps(str(workspace_root))}\n\n"
-        "[repos.app]\n"
-        f"path = {json.dumps(str(source))}\n",
-        encoding="utf-8",
-    )
+    path.write_text(repo_table("app", source), encoding="utf-8")
     return path
 
 
-def create_workspace(tmp_path: Path, source: Path, name: str) -> tuple[Path, Path]:
+def create_workspace(tmp_path: Path, source, name: str) -> tuple[Path, Path]:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", tmp_path / "workspaces", source)
+    source_path = source.path if hasattr(source, "path") else source
+    config = write_config(config_dir / "ws.toml", config_dir / "workspaces", source_path)
+    initialize_sources(config_dir)
+    if hasattr(source, "path"):
+        adopt_source(source, config_dir, "app")
     created = run_ws(config_dir, "create", name, "--config", str(config))
     assert created.returncode == 0, created.stderr
-    return tmp_path / "workspaces" / name, config
+    return config_dir / "workspaces" / name, config
 
 
 def run_remove_child(
@@ -139,9 +137,9 @@ def test_remove_recovers_after_real_sigkill_at_each_boundary(
     source = git_repo(f"remove-crash-{boundary}")
     source.branch("keep/branch")
     unrelated = tmp_path / "unrelated-source-worktree"
+    workspace, config = create_workspace(tmp_path, source, "sample")
     source.run("worktree", "add", str(unrelated), "keep/branch")
     unrelated_oid = git_output(unrelated, "rev-parse", "HEAD")
-    workspace, config = create_workspace(tmp_path, source.path, "sample")
     tombstone = workspace.parent / ".sample.removing"
     worktree = workspace / "repos" / "app"
     admin_path = _admin_path(worktree)

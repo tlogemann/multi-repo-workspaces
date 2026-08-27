@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -10,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from test_phase2 import adopt_source, initialize_sources, repo_table
 import ws_tool.workspace as workspace_module
 from ws_tool.errors import GitCommandError, WsError
 from ws_tool.models import RemovalSeal
@@ -45,29 +45,28 @@ def git_output(cwd: Path, *args: str, check: bool = True) -> str:
 
 
 def write_config(path: Path, workspace_root: Path, sources: dict[str, Path]) -> Path:
-    repos = "\n".join(
-        f'[repos."{name}"]\npath = {json.dumps(str(source))}' for name, source in sources.items()
-    )
-    path.write_text(
-        f"[project]\nworkspace_root = {json.dumps(str(workspace_root))}\n\n{repos}\n",
-        encoding="utf-8",
-    )
+    repos = "\n".join(repo_table(name, source) for name, source in sources.items())
+    path.write_text(repos, encoding="utf-8")
     return path
 
 
-def create_workspace(tmp_path: Path, source: Path, name: str) -> tuple[Path, Path]:
+def create_workspace(tmp_path: Path, source, name: str) -> tuple[Path, Path]:
     config_dir = tmp_path / f"config-{name}"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", tmp_path / "workspaces", {"app": source})
+    source_path = source.path if hasattr(source, "path") else source
+    config = write_config(config_dir / "ws.toml", config_dir / "workspaces", {"app": source_path})
+    initialize_sources(config_dir)
+    if hasattr(source, "path"):
+        adopt_source(source, config_dir, "app")
     result = run_ws(config_dir, "create", name, "--config", str(config))
     assert result.returncode == 0, result.stderr
-    return tmp_path / "workspaces" / name, config
+    return config_dir / "workspaces" / name, config
 
 
 @pytest.fixture
 def sealed_tombstone(tmp_path: Path, git_repo, monkeypatch) -> tuple[Path, Path, RemovalSeal]:
     source = git_repo("sealed-tombstone")
-    workspace, config = create_workspace(tmp_path, source.path, "sample")
+    workspace, config = create_workspace(tmp_path, source, "sample")
 
     # Stop immediately after the durable rename so this fixture supplies a
     # complete tombstone without making the test depend on private file text.
@@ -232,7 +231,7 @@ def test_empty_terminal_retry_retains_lifecycle_lock_on_final_fsync_failure(
     config_dir = tmp_path / "config-empty-terminal-fsync"
     config_dir.mkdir()
     config = write_config(config_dir / "ws.toml", tmp_path / "workspaces", {"app": source.path})
-    tombstone = tmp_path / "workspaces" / ".sample.removing"
+    tombstone = config_dir / "workspaces" / ".sample.removing"
     tombstone.mkdir(parents=True)
     workspace_root = tombstone.parent
     original_fsync = workspace_module.fsync_directory
@@ -257,7 +256,7 @@ def test_rename_fsync_failure_retains_lifecycle_and_tombstone_operation_locks(
     tmp_path: Path, git_repo, monkeypatch
 ) -> None:
     source = git_repo("rename-fsync-failure")
-    workspace, config = create_workspace(tmp_path, source.path, "rename-fsync")
+    workspace, config = create_workspace(tmp_path, source, "rename-fsync")
     tombstone = workspace.parent / ".rename-fsync.removing"
     original_fsync = workspace_module.fsync_directory
 
@@ -324,8 +323,8 @@ def test_remove_happy_path_preserves_source_branch_and_unrelated_worktree(tmp_pa
     source = git_repo("remove-happy")
     source.branch("keep/branch")
     unrelated = tmp_path / "unrelated-worktree"
+    workspace, config = create_workspace(tmp_path, source, "happy")
     source.run("worktree", "add", str(unrelated), "keep/branch")
-    workspace, config = create_workspace(tmp_path, source.path, "happy")
     worktree = workspace / "repos" / "app"
 
     removed = run_ws(tmp_path / "config-happy", "remove", "happy", "--config", str(config))
@@ -343,7 +342,7 @@ def test_remove_persists_embedded_and_standalone_seal_before_rename(
     tmp_path: Path, git_repo, monkeypatch
 ) -> None:
     source = git_repo("remove-seal")
-    workspace, config = create_workspace(tmp_path, source.path, "seal")
+    workspace, config = create_workspace(tmp_path, source, "seal")
     observed: list[tuple[Path, object, object]] = []
     original_write = workspace_module.write_removal_seal
 
@@ -370,7 +369,7 @@ def test_remove_persists_embedded_and_standalone_seal_before_rename(
 
 def test_remove_refuses_dirty_worktree_without_mutation(tmp_path: Path, git_repo):
     source = git_repo("remove-dirty")
-    workspace, config = create_workspace(tmp_path, source.path, "dirty")
+    workspace, config = create_workspace(tmp_path, source, "dirty")
     worktree = workspace / "repos" / "app"
     (worktree / "README.md").write_text("dirty\n", encoding="utf-8")
 
@@ -385,7 +384,7 @@ def test_remove_refuses_dirty_worktree_without_mutation(tmp_path: Path, git_repo
 
 def test_remove_refuses_active_context_without_mutation(tmp_path: Path, git_repo):
     source = git_repo("remove-context")
-    workspace, config = create_workspace(tmp_path, source.path, "context")
+    workspace, config = create_workspace(tmp_path, source, "context")
     worktree = workspace / "repos" / "app"
     entered = run_ws(worktree, "context", "app", "HEAD")
     assert entered.returncode == 0, entered.stderr
@@ -400,7 +399,7 @@ def test_remove_refuses_active_context_without_mutation(tmp_path: Path, git_repo
 
 def test_remove_refuses_unavailable_locked_source(tmp_path: Path, git_repo):
     source = git_repo("remove-unavailable")
-    workspace, config = create_workspace(tmp_path, source.path, "unavailable")
+    workspace, config = create_workspace(tmp_path, source, "unavailable")
     moved_source = tmp_path / "source-unavailable"
     source.path.rename(moved_source)
 
@@ -414,7 +413,7 @@ def test_remove_refuses_unavailable_locked_source(tmp_path: Path, git_repo):
 
 def test_remove_refuses_unregistered_expected_path_without_mutation(tmp_path: Path, git_repo):
     source = git_repo("remove-identity")
-    workspace, config = create_workspace(tmp_path, source.path, "identity")
+    workspace, config = create_workspace(tmp_path, source, "identity")
     worktree = workspace / "repos" / "app"
     git(source.path, "worktree", "remove", str(worktree))
     worktree.mkdir(parents=True)
@@ -433,7 +432,7 @@ def test_remove_refuses_absent_path_and_registration_before_durable_progress(
     tmp_path: Path, git_repo
 ) -> None:
     source = git_repo("remove-absent-initial")
-    workspace, config = create_workspace(tmp_path, source.path, "absent-initial")
+    workspace, config = create_workspace(tmp_path, source, "absent-initial")
     worktree = workspace / "repos" / "app"
     git(source.path, "worktree", "remove", str(worktree))
 
@@ -456,7 +455,7 @@ def test_remove_refuses_existing_lock_without_breaking_it(
     tmp_path: Path, git_repo, lock_kind: str
 ) -> None:
     source = git_repo(f"remove-lock-{lock_kind}")
-    workspace, config = create_workspace(tmp_path, source.path, f"lock-{lock_kind}")
+    workspace, config = create_workspace(tmp_path, source, f"lock-{lock_kind}")
     if lock_kind == "operation":
         lock = workspace / ".ws" / "operation.lock"
     else:
@@ -488,9 +487,12 @@ def test_remove_partial_later_failure_persists_progress_and_retries_only_remaini
         tmp_path / "workspaces",
         {"app": app.path, "library": library.path},
     )
+    initialize_sources(config_dir)
+    adopt_source(app, config_dir, "app")
+    adopt_source(library, config_dir, "library")
     result = run_ws(config_dir, "create", "partial", "--config", str(config))
     assert result.returncode == 0, result.stderr
-    workspace = tmp_path / "workspaces" / "partial"
+    workspace = config_dir / "workspaces" / "partial"
     original_run_git = workspace_module.run_git
     removes = 0
 
@@ -535,7 +537,7 @@ def test_remove_keyboard_interrupt_retains_locks_and_progress_for_retry(
     tmp_path: Path, git_repo, monkeypatch
 ) -> None:
     source = git_repo("remove-keyboard")
-    workspace, config = create_workspace(tmp_path, source.path, "keyboard")
+    workspace, config = create_workspace(tmp_path, source, "keyboard")
     worktree = workspace / "repos" / "app"
     original_run_git = workspace_module.run_git
 
@@ -574,7 +576,7 @@ def test_remove_crash_after_git_deletion_credits_absent_state_only_on_retry(
     tmp_path: Path, git_repo, monkeypatch
 ) -> None:
     source = git_repo("remove-absent-retry")
-    workspace, config = create_workspace(tmp_path, source.path, "absent-retry")
+    workspace, config = create_workspace(tmp_path, source, "absent-retry")
     worktree = workspace / "repos" / "app"
     original_run_git = workspace_module.run_git
 
@@ -617,7 +619,7 @@ def test_remove_tombstone_cleanup_interrupt_retains_parseable_state_and_locks(
     tmp_path: Path, git_repo, monkeypatch
 ) -> None:
     source = git_repo("remove-tombstone-crash")
-    workspace, config = create_workspace(tmp_path, source.path, "tombstone-crash")
+    workspace, config = create_workspace(tmp_path, source, "tombstone-crash")
     tombstone = workspace.parent / ".tombstone-crash.removing"
 
     def interrupt_cleanup(path, seal):
@@ -660,7 +662,7 @@ def test_remove_config_disagreement_inside_workspace_refuses_before_mutation(
     tmp_path: Path, git_repo
 ) -> None:
     source = git_repo("remove-config-disagreement")
-    workspace, config = create_workspace(tmp_path, source.path, "disagreement")
+    workspace, config = create_workspace(tmp_path, source, "disagreement")
     other_config_dir = tmp_path / "other-config"
     other_config_dir.mkdir()
     other_config = write_config(

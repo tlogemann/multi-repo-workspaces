@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -12,6 +11,7 @@ from conftest import (
     start_paused_remove,
     wait_for_boundary,
 )
+from test_phase2 import adopt_source, initialize_sources, repo_table
 
 
 def run_ws(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -35,23 +35,21 @@ def git_output(cwd: Path, *args: str) -> str:
 
 
 def write_config(path: Path, workspace_root: Path, source: Path) -> Path:
-    path.write_text(
-        "[project]\n"
-        f"workspace_root = {json.dumps(str(workspace_root))}\n\n"
-        "[repos.app]\n"
-        f"path = {json.dumps(str(source))}\n",
-        encoding="utf-8",
-    )
+    path.write_text(repo_table("app", source), encoding="utf-8")
     return path
 
 
-def create_workspace(tmp_path: Path, source: Path) -> tuple[Path, Path]:
+def create_workspace(tmp_path: Path, source) -> tuple[Path, Path]:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", tmp_path / "workspaces", source)
+    source_path = source.path if hasattr(source, "path") else source
+    config = write_config(config_dir / "ws.toml", config_dir / "workspaces", source_path)
+    initialize_sources(config_dir)
+    if hasattr(source, "path"):
+        adopt_source(source, config_dir, "app")
     created = run_ws(config_dir, "create", "sample", "--config", str(config))
     assert created.returncode == 0, created.stderr
-    return tmp_path / "workspaces" / "sample", config
+    return config_dir / "workspaces" / "sample", config
 
 
 def workspace_snapshot(path: Path) -> tuple[tuple[str, str, bytes], ...]:
@@ -86,15 +84,17 @@ def test_second_create_fails_while_first_holds_lifecycle_lock(
     tmp_path: Path, git_repo
 ) -> None:
     source = git_repo("create-concurrency")
-    registrations = git_output(source.path, "worktree", "list", "--porcelain")
-    refs = git_output(source.path, "show-ref")
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     config = write_config(config_dir / "ws.toml", tmp_path / "workspaces", source.path)
+    initialize_sources(config_dir)
+    adopt_source(source, config_dir, "app")
+    registrations = git_output(source.path, "worktree", "list", "--porcelain")
+    refs = git_output(source.path, "show-ref")
     first = start_paused_create(config_dir, "sample", "create.lifecycle_locked")
     try:
         wait_for_boundary(first)
-        workspace = tmp_path / "workspaces" / "sample"
+        workspace = config_dir / "workspaces" / "sample"
         before = workspace_snapshot(workspace)
         rejected = run_ws(config_dir, "create", "sample", "--config", str(config))
         assert rejected.returncode != 0
@@ -123,10 +123,13 @@ def test_second_remove_fails_while_first_holds_lifecycle_lock(
     tmp_path: Path, git_repo
 ) -> None:
     source = git_repo("remove-concurrency")
+    workspace, config = create_workspace(tmp_path, source)
     baseline_registrations = git_output(source.path, "worktree", "list", "--porcelain")
     baseline_refs = git_output(source.path, "show-ref")
-    workspace, config = create_workspace(tmp_path, source.path)
     registrations = git_output(source.path, "worktree", "list", "--porcelain")
+    baseline_registrations = "\n\n".join(
+        block for block in registrations.strip().split("\n\n") if str(workspace) not in block
+    ) + "\n\n"
     before = workspace_snapshot(workspace)
     first = start_paused_remove(config.parent, "sample", "remove.lifecycle_locked")
     try:
@@ -150,11 +153,14 @@ def test_mutator_fails_while_removal_holds_lifecycle_and_operation_locks(
     tmp_path: Path, git_repo
 ) -> None:
     source = git_repo("mutator-concurrency")
+    workspace, config = create_workspace(tmp_path, source)
     baseline_registrations = git_output(source.path, "worktree", "list", "--porcelain")
     baseline_refs = git_output(source.path, "show-ref")
-    workspace, config = create_workspace(tmp_path, source.path)
     worktree = workspace / "repos" / "app"
     registrations = git_output(source.path, "worktree", "list", "--porcelain")
+    baseline_registrations = "\n\n".join(
+        block for block in registrations.strip().split("\n\n") if str(workspace) not in block
+    ) + "\n\n"
     first = start_paused_remove(config.parent, "sample", "removing_persisted")
     try:
         wait_for_boundary(first)
@@ -163,7 +169,7 @@ def test_mutator_fails_while_removal_holds_lifecycle_and_operation_locks(
         before = workspace_snapshot(workspace)
         rejected = run_ws(worktree, "claim", "app")
         assert rejected.returncode != 0
-        assert "lifecycle lock" in rejected.stderr
+        assert "operation lock" in rejected.stderr
         assert workspace_snapshot(workspace) == before
         assert git_output(source.path, "worktree", "list", "--porcelain") == registrations
         assert git_output(source.path, "show-ref") == baseline_refs

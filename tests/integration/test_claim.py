@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+from test_phase2 import adopt_source, initialize_sources, repo_table as _repo_table
 from ws_tool.git import worktree_admin_path
 from ws_tool.models import ContextState, RemovalRepoState, RemovalState, RepoState, WorkspaceState
 from ws_tool.serialization import write_workspace_state
@@ -27,16 +27,12 @@ def run_ws(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def write_config(path: Path, workspace_root: str, repos: str) -> Path:
-    path.write_text(
-        f"[project]\nworkspace_root = {json.dumps(workspace_root)}\n\n{repos}",
-        encoding="utf-8",
-    )
+    path.write_text(repos, encoding="utf-8")
     return path
 
 
 def repo_table(name: str, source: Path, default_ref: str | None = None) -> str:
-    default = "" if default_ref is None else f'\ndefault_ref = "{default_ref}"'
-    return f'[repos."{name}"]\npath = {json.dumps(str(source))}{default}\n'
+    return _repo_table(name, source, default_ref)
 
 
 def git_output(cwd: Path, *args: str, check: bool = True) -> str:
@@ -44,20 +40,33 @@ def git_output(cwd: Path, *args: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-def create_config(tmp_path: Path, source: Path, *, default_ref: str | None = None) -> Path:
+def create_config(tmp_path: Path, source, *, default_ref: str | None = None) -> Path:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    return write_config(
+    source_path = source.path if hasattr(source, "path") else source
+    config = write_config(
         config_dir / "ws.toml",
         "../workspaces",
-        repo_table("app", source, default_ref),
+        repo_table("app", source_path, default_ref),
     )
+    initialize_sources(config_dir)
+    if hasattr(source, "path"):
+        adopt_source(source, config_dir, "app")
+    else:
+        subprocess.run(
+            ["git", "switch", "--detach", "HEAD"],
+            cwd=config_dir / "repos" / "app",
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    return config
 
 
 def create_workspace(tmp_path: Path, source: Path, name: str, config: Path) -> Path:
     result = run_ws(config.parent, "create", name, "--config", str(config))
     assert result.returncode == 0, result.stderr
-    return tmp_path / "workspaces" / name
+    return config.parent / "workspaces" / name
 
 
 def test_claim_uses_locked_base_but_source_default_uses_current_default(
@@ -65,7 +74,7 @@ def test_claim_uses_locked_base_but_source_default_uses_current_default(
 ) -> None:
     source = git_repo("claim-defaults")
     initial = source.run("rev-parse", "HEAD").stdout.strip()
-    config = create_config(tmp_path, source.path, default_ref="main")
+    config = create_config(tmp_path, source, default_ref="main")
     locked = create_workspace(tmp_path, source.path, "locked", config)
     current = create_workspace(tmp_path, source.path, "current", config)
     latest = source.commit("advanced", content="advanced\n")
@@ -99,7 +108,7 @@ def test_claim_explicit_source_and_target(tmp_path: Path, git_repo) -> None:
     source.branch("feature/base")
     base = source.run("rev-parse", "feature/base").stdout.strip()
     source.commit("main advance", content="main advance\n")
-    config = create_config(tmp_path, source.path)
+    config = create_config(tmp_path, source)
     workspace = create_workspace(tmp_path, source.path, "explicit", config)
 
     result = run_ws(
@@ -122,7 +131,7 @@ def test_claim_explicit_source_and_target(tmp_path: Path, git_repo) -> None:
 
 def test_claim_preserves_dirty_detached_worktree_changes(tmp_path: Path, git_repo) -> None:
     source = git_repo("claim-dirty")
-    config = create_config(tmp_path, source.path)
+    config = create_config(tmp_path, source)
     workspace = create_workspace(tmp_path, source.path, "dirty", config)
     worktree = workspace / "repos" / "app"
     (worktree / "README.md").write_text("staged change\n", encoding="utf-8")
@@ -140,7 +149,7 @@ def test_claim_preserves_dirty_detached_worktree_changes(tmp_path: Path, git_rep
 
 def test_claim_exact_idempotency_does_not_resolve_stale_source(tmp_path: Path, git_repo) -> None:
     source = git_repo("claim-idempotent")
-    config = create_config(tmp_path, source.path)
+    config = create_config(tmp_path, source)
     workspace = create_workspace(tmp_path, source.path, "idempotent", config)
     worktree = workspace / "repos" / "app"
     first = run_ws(worktree, "claim", "app")
@@ -165,7 +174,7 @@ def test_claim_rejects_existing_target_branch_without_mutating_detached_worktree
 ) -> None:
     source = git_repo("claim-collision")
     source.branch("feature/existing")
-    config = create_config(tmp_path, source.path)
+    config = create_config(tmp_path, source)
     workspace = create_workspace(tmp_path, source.path, "collision", config)
     worktree = workspace / "repos" / "app"
     before = git_output(worktree, "rev-parse", "HEAD")
@@ -182,7 +191,7 @@ def test_claim_rejects_target_checked_out_by_another_workspace_worktree(
     tmp_path: Path, git_repo
 ) -> None:
     source = git_repo("claim-worktree-collision")
-    config = create_config(tmp_path, source.path)
+    config = create_config(tmp_path, source)
     first_workspace = create_workspace(tmp_path, source.path, "first", config)
     second_workspace = create_workspace(tmp_path, source.path, "second", config)
     first_worktree = first_workspace / "repos" / "app"
@@ -206,7 +215,7 @@ def test_claim_rejects_already_claimed_repository_on_different_branch(
     tmp_path: Path, git_repo
 ) -> None:
     source = git_repo("claim-different-branch")
-    config = create_config(tmp_path, source.path)
+    config = create_config(tmp_path, source)
     workspace = create_workspace(tmp_path, source.path, "different", config)
     worktree = workspace / "repos" / "app"
     first = run_ws(worktree, "claim", "app", "--target", "feature/first")
@@ -226,8 +235,8 @@ def test_claim_default_uses_locked_selector_after_config_and_tag_source_are_remo
 ) -> None:
     source = git_repo("claim-locked-selector")
     source.run("tag", "v1")
-    config = create_config(tmp_path, source.path, default_ref="main")
-    workspace = tmp_path / "workspaces" / "tagged"
+    config = create_config(tmp_path, source, default_ref="main")
+    workspace = config.parent / "workspaces" / "tagged"
     created = run_ws(
         config.parent,
         "create",
@@ -275,6 +284,12 @@ def test_claim_default_uses_explicit_locked_selector_for_bare_source_after_confi
     config.unlink()
     latest = seed.commit("bare default advanced", content="bare default advanced\n")
     seed.run("push", "origin", "main")
+    subprocess.run(["git", "fetch", "origin"], cwd=config.parent / "repos" / "app", check=True)
+    subprocess.run(
+        ["git", "branch", "--force", "main", "refs/remotes/origin/main"],
+        cwd=config.parent / "repos" / "app",
+        check=True,
+    )
 
     result = run_ws(
         workspace / "repos" / "app",
@@ -304,7 +319,7 @@ def test_claim_rejects_null_locked_default_selector(
     seed.run("push", "origin", "main")
     seed.run("--git-dir", str(bare), "symbolic-ref", "HEAD", "refs/heads/main")
     config = create_config(tmp_path, bare)
-    workspace = tmp_path / "workspaces" / "bare"
+    workspace = config.parent / "workspaces" / "bare"
     config_result = run_ws(
         config.parent,
         "create",
@@ -331,7 +346,7 @@ def test_claim_rejects_null_locked_default_selector(
 def test_claim_refuses_context_and_removal_states(tmp_path: Path, git_repo) -> None:
     source = git_repo("claim-state-guards")
     commit = source.run("rev-parse", "HEAD").stdout.strip()
-    config = create_config(tmp_path, source.path)
+    config = create_config(tmp_path, source)
     context_workspace = create_workspace(tmp_path, source.path, "context", config)
     context_state = WorkspaceState(
         workspace_name="context",

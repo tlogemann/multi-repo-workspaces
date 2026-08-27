@@ -33,16 +33,116 @@ def run_ws(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def write_config(path: Path, workspace_root: str, repos: str) -> Path:
-    path.write_text(
-        f"[project]\nworkspace_root = {workspace_root}\n\n{repos}",
-        encoding="utf-8",
-    )
+    path.write_text(repos, encoding="utf-8")
     return path
 
 
 def repo_table(name: str, source: Path, default_ref: str | None = None) -> str:
     default = "" if default_ref is None else f'\ndefault_ref = "{default_ref}"'
-    return f'[repos."{name}"]\npath = "{source}"{default}\n'
+    url = (
+        source
+        if source.name.endswith(".git") and source.name.removesuffix(".git") == name
+        else source.parent / f"{name}.git"
+    )
+    if url != source and not url.exists():
+        if source.name.endswith(".git"):
+            url.symlink_to(source, target_is_directory=True)
+        else:
+            cloned = subprocess.run(
+                ["git", "clone", "--bare", str(source), str(url)],
+                text=True,
+                capture_output=True,
+            )
+            assert cloned.returncode == 0, cloned.stderr
+    return f'[[repos]]\nurl = "{url}"{default}\n'
+
+
+def initialize_sources(project_root: Path) -> None:
+    result = run_ws(project_root, "init")
+    assert result.returncode == 0, result.stderr
+    for source in (project_root / "repos").iterdir():
+        fetched = subprocess.run(
+            [
+                "git",
+                "fetch",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+            cwd=source,
+            text=True,
+            capture_output=True,
+        )
+        assert fetched.returncode == 0, fetched.stderr
+        current = subprocess.run(
+            ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+            cwd=source,
+            text=True,
+            capture_output=True,
+            check=False,
+        ).stdout.strip()
+        branches = subprocess.run(
+            ["git", "for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/origin"],
+            cwd=source,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        for branch in branches.stdout.splitlines():
+            if branch not in {"HEAD", current}:
+                subprocess.run(
+                    ["git", "branch", "--force", branch, f"refs/remotes/origin/{branch}"],
+                    cwd=source,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+        subprocess.run(
+            ["git", "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+            cwd=source,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+
+def copy_remote_metadata(source: Path, destination: Path) -> None:
+    subprocess.run(
+        ["git", "fetch", str(source), "+refs/*:refs/remotes/__test_source/*"],
+        cwd=destination,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    refs = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes"],
+        cwd=source,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    for line in refs.stdout.splitlines():
+        ref, oid = line.split()
+        subprocess.run(["git", "update-ref", ref, oid], cwd=destination, check=True)
+    symbolic = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname)%00%(symref)", "refs/remotes"],
+        cwd=source,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    for line in symbolic.stdout.splitlines():
+        ref, target = line.split("\x00", 1)
+        if target:
+            subprocess.run(["git", "symbolic-ref", ref, target], cwd=destination, check=True)
+
+
+def initialized_source(project_root: Path, name: str) -> Path:
+    return project_root / "repos" / name
+
+
+def adopt_source(source, project_root: Path, name: str) -> None:
+    source.path = initialized_source(project_root, name)
 
 
 def test_create_multi_repo_and_status_from_nested_directory(tmp_path: Path, git_repo) -> None:
@@ -57,11 +157,14 @@ def test_create_multi_repo_and_status_from_nested_directory(tmp_path: Path, git_
         '"../workspaces"',
         repo_table("app", app.path) + repo_table("library", library.path),
     )
+    initialize_sources(config_dir)
+    adopt_source(app, config_dir, "app")
+    adopt_source(library, config_dir, "library")
 
     created = run_ws(config_dir, "create", "demo", "--config", str(config))
 
     assert created.returncode == 0, created.stderr
-    workspace = tmp_path / "workspaces" / "demo"
+    workspace = config_dir / "workspaces" / "demo"
     assert (workspace / "workspace.lock.toml").is_file()
     assert (workspace / ".ws" / "state.toml").is_file()
     lock = deserialize_workspace_lock(
@@ -121,6 +224,10 @@ def test_create_source_override_branch_tag_and_sha(tmp_path: Path, git_repo) -> 
         + repo_table("tag", tag_source.path)
         + repo_table("sha", sha_source.path),
     )
+    initialize_sources(config_dir)
+    branch_source = initialized_source(config_dir, "branch")
+    tag_source = initialized_source(config_dir, "tag")
+    sha_source = initialized_source(config_dir, "sha")
 
     result = run_ws(
         config_dir,
@@ -138,10 +245,10 @@ def test_create_source_override_branch_tag_and_sha(tmp_path: Path, git_repo) -> 
 
     assert result.returncode == 0, result.stderr
     lock = deserialize_workspace_lock(
-        (tmp_path / "workspaces" / "demo" / "workspace.lock.toml").read_text(encoding="utf-8")
+        (config_dir / "workspaces" / "demo" / "workspace.lock.toml").read_text(encoding="utf-8")
     )
     assert lock.repos["branch"].base_commit == base
-    assert lock.repos["tag"].base_commit == tag_source.run("rev-parse", "v1").stdout.strip()
+    assert lock.repos["tag"].base_commit == run_git_output(tag_source, "rev-parse", "v1")
     assert lock.repos["sha"].base_commit == second
 
 
@@ -160,9 +267,11 @@ def test_status_rejects_renamed_workspace_with_authoritative_lock_name(
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+    initialize_sources(config_dir)
+    adopt_source(source, config_dir, "app")
     assert run_ws(config_dir, "create", "original", "--config", str(config)).returncode == 0
-    original = tmp_path / "workspaces" / "original"
-    renamed = tmp_path / "workspaces" / "renamed"
+    original = config_dir / "workspaces" / "original"
+    renamed = config_dir / "workspaces" / "renamed"
     original.rename(renamed)
 
     result = run_ws(renamed, "status", "--json")
@@ -179,8 +288,10 @@ def test_status_rejects_copied_metadata_without_registered_worktrees(
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+    initialize_sources(config_dir)
+    adopt_source(source, config_dir, "app")
     assert run_ws(config_dir, "create", "source", "--config", str(config)).returncode == 0
-    original = tmp_path / "workspaces" / "source"
+    original = config_dir / "workspaces" / "source"
     copied = tmp_path / "other" / "source"
     copied.mkdir(parents=True)
     shutil.copy2(original / "workspace.lock.toml", copied / "workspace.lock.toml")
@@ -209,6 +320,8 @@ def test_create_bare_source_with_explicit_override_records_null_default(
         '"../workspaces"',
         repo_table("bare", bare),
     )
+    initialize_sources(config_dir)
+    subprocess.run(["git", "switch", "--detach", "HEAD"], cwd=config_dir / "repos" / "bare", check=True)
 
     result = run_ws(
         config_dir,
@@ -222,10 +335,10 @@ def test_create_bare_source_with_explicit_override_records_null_default(
 
     assert result.returncode == 0, result.stderr
     lock = deserialize_workspace_lock(
-        (tmp_path / "workspaces" / "bare-demo" / "workspace.lock.toml").read_text(encoding="utf-8")
+        (config_dir / "workspaces" / "bare-demo" / "workspace.lock.toml").read_text(encoding="utf-8")
     )
     assert lock.repos["bare"].default_selector is None
-    assert (tmp_path / "workspaces" / "bare-demo" / "repos" / "bare").is_dir()
+    assert (config_dir / "workspaces" / "bare-demo" / "repos" / "bare").is_dir()
 
 
 def test_explicit_source_allows_missing_default_selector(tmp_path: Path, git_repo) -> None:
@@ -237,6 +350,7 @@ def test_explicit_source_allows_missing_default_selector(tmp_path: Path, git_rep
         '"../workspaces"',
         repo_table("app", source.path, "missing/default"),
     )
+    initialize_sources(config_dir)
 
     result = run_ws(
         config_dir,
@@ -250,7 +364,7 @@ def test_explicit_source_allows_missing_default_selector(tmp_path: Path, git_rep
 
     assert result.returncode == 0, result.stderr
     lock = deserialize_workspace_lock(
-        (tmp_path / "workspaces" / "missing-default-demo" / "workspace.lock.toml").read_text(
+        (config_dir / "workspaces" / "missing-default-demo" / "workspace.lock.toml").read_text(
             encoding="utf-8"
         )
     )
@@ -263,10 +377,11 @@ def test_explicit_source_allows_ambiguous_remote_defaults_in_bare_source(
     seed = git_repo("ambiguous-seed")
     seed.branch("develop")
     seed.commit("main divergence", content="main divergence\n")
-    bare = bare_git_repo("ambiguous.git")
+    bare = bare_git_repo("app.git")
     seed.run("remote", "add", "origin", str(bare))
     seed.run("push", "origin", "main")
     seed.run("push", "origin", "develop")
+    seed.run("--git-dir", str(bare), "symbolic-ref", "HEAD", "refs/heads/main")
     seed.run(
         "--git-dir",
         str(bare),
@@ -284,6 +399,8 @@ def test_explicit_source_allows_ambiguous_remote_defaults_in_bare_source(
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", bare))
+    initialize_sources(config_dir)
+    subprocess.run(["git", "switch", "--detach", "HEAD"], cwd=config_dir / "repos" / "app", check=True)
 
     result = run_ws(
         config_dir,
@@ -297,7 +414,7 @@ def test_explicit_source_allows_ambiguous_remote_defaults_in_bare_source(
 
     assert result.returncode == 0, result.stderr
     lock = deserialize_workspace_lock(
-        (tmp_path / "workspaces" / "ambiguous-demo" / "workspace.lock.toml").read_text(
+        (config_dir / "workspaces" / "ambiguous-demo" / "workspace.lock.toml").read_text(
             encoding="utf-8"
         )
     )
@@ -325,7 +442,9 @@ def test_create_rejects_same_named_remote_heads_at_different_commits(
     )
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", origin))
+    initialize_sources(config_dir)
+    copy_remote_metadata(source.path, config_dir / "repos" / "app")
 
     result = run_ws(config_dir, "create", "disagreeing", "--config", str(config))
 
@@ -355,13 +474,15 @@ def test_create_accepts_differently_named_remote_heads_at_same_commit(
     )
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", origin))
+    initialize_sources(config_dir)
+    copy_remote_metadata(source.path, config_dir / "repos" / "app")
 
     result = run_ws(config_dir, "create", "agreeing", "--config", str(config))
 
     assert result.returncode == 0, result.stderr
     lock = deserialize_workspace_lock(
-        (tmp_path / "workspaces" / "agreeing" / "workspace.lock.toml").read_text(
+        (config_dir / "workspaces" / "agreeing" / "workspace.lock.toml").read_text(
             encoding="utf-8"
         )
     )
@@ -383,7 +504,8 @@ def test_create_rejects_unresolvable_remote_symbolic_head(
     )
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+    config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", remote))
+    initialize_sources(config_dir)
 
     result = run_ws(config_dir, "create", "invalid", "--config", str(config))
 
@@ -402,7 +524,9 @@ def test_create_rejects_existing_target_and_lifecycle_lock_without_cleanup(
         '"../workspaces"',
         repo_table("app", source.path),
     )
-    target = tmp_path / "workspaces" / "demo"
+    initialize_sources(config_dir)
+    adopt_source(source, config_dir, "app")
+    target = config_dir / "workspaces" / "demo"
     target.mkdir(parents=True)
     marker = target / "keep.txt"
     marker.write_text("keep\n", encoding="utf-8")
@@ -421,6 +545,8 @@ def test_create_uses_only_canonical_cwd_config_by_default(tmp_path: Path, git_re
         '"workspaces"',
         repo_table("app", source.path),
     )
+    initialize_sources(tmp_path)
+    source = initialized_source(tmp_path, "app")
 
     created = run_ws(tmp_path, "create", "default-config")
 
@@ -446,6 +572,9 @@ def test_create_rolls_back_real_worktrees_after_injected_second_add_failure(
         '"../workspaces"',
         repo_table("first", first.path) + repo_table("second", second.path),
     )
+    initialize_sources(config_dir)
+    adopt_source(first, config_dir, "first")
+    adopt_source(second, config_dir, "second")
     original_run_git = workspace_module.run_git
     worktree_adds = 0
 
@@ -463,7 +592,7 @@ def test_create_rolls_back_real_worktrees_after_injected_second_add_failure(
     with pytest.raises(GitCommandError, match="injected worktree failure"):
         create_workspace("rollback", config_path=config)
 
-    workspace = tmp_path / "workspaces" / "rollback"
+    workspace = config_dir / "workspaces" / "rollback"
     assert not workspace.exists()
     for source in (first, second):
         registered = source.run("worktree", "list", "--porcelain").stdout
@@ -482,6 +611,9 @@ def test_create_retains_lifecycle_lock_on_unexpected_identity_cleanup_failure(
         '"../workspaces"',
         repo_table("first", first.path) + repo_table("second", second.path),
     )
+    initialize_sources(config_dir)
+    adopt_source(first, config_dir, "first")
+    adopt_source(second, config_dir, "second")
     original_run_git = workspace_module.run_git
     original_validate = workspace_module.validate_worktree_registration
     worktree_adds = 0
@@ -507,7 +639,7 @@ def test_create_retains_lifecycle_lock_on_unexpected_identity_cleanup_failure(
     with pytest.raises(WsError, match="cleanup failed unexpectedly|Retain"):
         create_workspace("unexpected-rollback", config_path=config)
 
-    workspace_root = tmp_path / "workspaces"
+    workspace_root = config_dir / "workspaces"
     workspace = workspace_root / "unexpected-rollback"
     assert (workspace_root / ".unexpected-rollback.lifecycle.lock").is_dir()
     assert (workspace / "repos" / "first").is_dir()
@@ -526,9 +658,12 @@ def test_sigint_during_creation_reraises_after_verified_rollback(
         '"../workspaces"',
         repo_table("first", first.path) + repo_table("second", second.path),
     )
+    initialize_sources(config_dir)
+    adopt_source(first, config_dir, "first")
+    adopt_source(second, config_dir, "second")
     original_run_git = workspace_module.run_git
     worktree_adds = 0
-    workspace_root = tmp_path / "workspaces"
+    workspace_root = config_dir / "workspaces"
     workspace = workspace_root / "sigint-creation"
 
     def interrupt_second_worktree_add(args, *, cwd=None, check=True):
@@ -565,9 +700,12 @@ def test_sigint_with_ordinary_cleanup_failure_reraises_original_interrupt(
         '"../workspaces"',
         repo_table("first", first.path) + repo_table("second", second.path),
     )
+    initialize_sources(config_dir)
+    adopt_source(first, config_dir, "first")
+    adopt_source(second, config_dir, "second")
     original_run_git = workspace_module.run_git
     worktree_adds = 0
-    workspace_root = tmp_path / "workspaces"
+    workspace_root = config_dir / "workspaces"
     workspace = workspace_root / "sigint-original"
 
     def interrupt_second_worktree_add(args, *, cwd=None, check=True):
@@ -610,9 +748,12 @@ def test_sigint_during_cleanup_retains_both_creation_locks(
         '"../workspaces"',
         repo_table("first", first.path) + repo_table("second", second.path),
     )
+    initialize_sources(config_dir)
+    adopt_source(first, config_dir, "first")
+    adopt_source(second, config_dir, "second")
     original_run_git = workspace_module.run_git
     worktree_adds = 0
-    workspace_root = tmp_path / "workspaces"
+    workspace_root = config_dir / "workspaces"
     workspace = workspace_root / "sigint-cleanup"
 
     def fail_second_worktree_add(args, *, cwd=None, check=True):
@@ -647,7 +788,9 @@ def test_create_holds_both_locks_until_successful_completion(
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
-    workspace_root = tmp_path / "workspaces"
+    initialize_sources(config_dir)
+    adopt_source(source, config_dir, "app")
+    workspace_root = config_dir / "workspaces"
     workspace = workspace_root / "locks"
     original_release = workspace_module._release_operation_lock
     observed: list[tuple[bool, bool]] = []
@@ -670,7 +813,9 @@ def test_create_rejects_dangling_removal_tombstone_symlink(tmp_path: Path, git_r
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
-    workspace_root = tmp_path / "workspaces"
+    initialize_sources(config_dir)
+    adopt_source(source, config_dir, "app")
+    workspace_root = config_dir / "workspaces"
     workspace_root.mkdir()
     tombstone = workspace_root / ".dangling.removing"
     tombstone.symlink_to(tmp_path / "does-not-exist")
@@ -695,9 +840,12 @@ def test_failed_cleanup_retains_dirty_worktree_and_lifecycle_lock(
         '"../workspaces"',
         repo_table("first", first.path) + repo_table("second", second.path),
     )
+    initialize_sources(config_dir)
+    adopt_source(first, config_dir, "first")
+    adopt_source(second, config_dir, "second")
     original_run_git = workspace_module.run_git
     worktree_adds = 0
-    worktree = tmp_path / "workspaces" / "dirty-rollback" / "repos" / "first"
+    worktree = config_dir / "workspaces" / "dirty-rollback" / "repos" / "first"
 
     def fail_after_dirtying_first(args, *, cwd=None, check=True):
         nonlocal worktree_adds
@@ -715,7 +863,7 @@ def test_failed_cleanup_retains_dirty_worktree_and_lifecycle_lock(
         create_workspace("dirty-rollback", config_path=config)
 
     assert (worktree / "concurrent.txt").read_text(encoding="utf-8") == "preserve\n"
-    assert (tmp_path / "workspaces" / ".dirty-rollback.lifecycle.lock").is_dir()
+    assert (config_dir / "workspaces" / ".dirty-rollback.lifecycle.lock").is_dir()
     assert str(worktree) in first.run("worktree", "list", "--porcelain").stdout
 
 
@@ -724,8 +872,10 @@ def test_status_reports_durable_context_mode_and_phase(tmp_path: Path, git_repo)
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     config = write_config(config_dir / "ws.toml", '"../workspaces"', repo_table("app", source.path))
+    initialize_sources(config_dir)
+    adopt_source(source, config_dir, "app")
     assert run_ws(config_dir, "create", "context-status", "--config", str(config)).returncode == 0
-    workspace = tmp_path / "workspaces" / "context-status"
+    workspace = config_dir / "workspaces" / "context-status"
     state_path = workspace / ".ws" / "state.toml"
     commit = source.run("rev-parse", "HEAD").stdout.strip()
     state = WorkspaceState(
@@ -771,8 +921,11 @@ def test_status_reports_partial_removal_after_completed_worktree_is_removed(
         '"../workspaces"',
         repo_table("first", first.path) + repo_table("second", second.path),
     )
+    initialize_sources(config_dir)
+    adopt_source(first, config_dir, "first")
+    adopt_source(second, config_dir, "second")
     assert run_ws(config_dir, "create", "removal-status", "--config", str(config)).returncode == 0
-    workspace = tmp_path / "workspaces" / "removal-status"
+    workspace = config_dir / "workspaces" / "removal-status"
     first_worktree = workspace / "repos" / "first"
     second_worktree = workspace / "repos" / "second"
     first_admin = worktree_admin_path(first_worktree)

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from test_phase2 import adopt_source, initialize_sources, repo_table as _repo_table
 import ws_tool.workspace as workspace_module
 from ws_tool.errors import GitCommandError, WsError
 from ws_tool.serialization import deserialize_workspace_state, serialize_workspace_state
@@ -38,45 +39,44 @@ def git_output(cwd: Path, *args: str, check: bool = True) -> str:
 
 
 def write_config(path: Path, source: Path, *, default_ref: str | None = None) -> Path:
-    configured = "" if default_ref is None else f'\ndefault_ref = "{default_ref}"'
-    path.write_text(
-        '[project]\nworkspace_root = "../workspaces"\n\n'
-        f'[repos."app"]\npath = {json.dumps(str(source))}{configured}\n',
-        encoding="utf-8",
-    )
+    path.write_text(_repo_table("app", source, default_ref), encoding="utf-8")
     return path
 
 
 def write_two_repo_config(path: Path, app_source: Path, api_source: Path) -> Path:
     path.write_text(
-        '[project]\nworkspace_root = "../workspaces"\n\n'
-        f'[repos."app"]\npath = {json.dumps(str(app_source))}\n\n'
-        f'[repos."api"]\npath = {json.dumps(str(api_source))}\n',
-        encoding="utf-8",
+        _repo_table("app", app_source) + _repo_table("api", api_source), encoding="utf-8"
     )
     return path
 
 
 def create_workspace(
-    tmp_path: Path, source: Path, name: str, *, default_ref: str | None = None
+    tmp_path: Path, source, name: str, *, default_ref: str | None = None
 ) -> Path:
     config_dir = tmp_path / f"config-{name}"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", source, default_ref=default_ref)
+    source_path = source.path if hasattr(source, "path") else source
+    config = write_config(config_dir / "ws.toml", source_path, default_ref=default_ref)
+    initialize_sources(config_dir)
+    if hasattr(source, "path"):
+        adopt_source(source, config_dir, "app")
     result = run_ws(config_dir, "create", name, "--config", str(config))
     assert result.returncode == 0, result.stderr
-    return tmp_path / "workspaces" / name
+    return config_dir / "workspaces" / name
 
 
 def create_two_repo_workspace(
-    tmp_path: Path, app_source: Path, api_source: Path, name: str
+    tmp_path: Path, app_source, api_source, name: str
 ) -> Path:
     config_dir = tmp_path / f"config-{name}"
     config_dir.mkdir()
-    config = write_two_repo_config(config_dir / "ws.toml", app_source, api_source)
+    config = write_two_repo_config(config_dir / "ws.toml", app_source.path, api_source.path)
+    initialize_sources(config_dir)
+    adopt_source(app_source, config_dir, "app")
+    adopt_source(api_source, config_dir, "api")
     result = run_ws(config_dir, "create", name, "--config", str(config))
     assert result.returncode == 0, result.stderr
-    return tmp_path / "workspaces" / name
+    return config_dir / "workspaces" / name
 
 
 def context_state(workspace: Path):
@@ -97,7 +97,7 @@ def effect_pair(context, operation: str):
 
 def prepare_dirty_context(tmp_path: Path, git_repo, name: str):
     source = git_repo(name)
-    workspace = create_workspace(tmp_path, source.path, name)
+    workspace = create_workspace(tmp_path, source, name)
     worktree = workspace / "repos" / "app"
     assert run_ws(worktree, "claim", "app", "--target", f"feature/{name}").returncode == 0
     (worktree / "README.md").write_text("saved content\n", encoding="utf-8")
@@ -114,9 +114,11 @@ def test_clean_claimed_context_uses_locked_default_and_restores_branch(
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     config = write_config(config_dir / "ws.toml", source.path, default_ref="main")
+    initialize_sources(config_dir)
+    adopt_source(source, config_dir, "app")
     result = run_ws(config_dir, "create", "clean", "--config", str(config))
     assert result.returncode == 0, result.stderr
-    workspace = tmp_path / "workspaces" / "clean"
+    workspace = config_dir / "workspaces" / "clean"
     worktree = workspace / "repos" / "app"
     assert run_ws(worktree, "claim", "app", "--target", "feature/foo").returncode == 0
     saved_head = git_output(worktree, "rev-parse", "HEAD")
@@ -150,7 +152,7 @@ def test_clean_claimed_context_uses_locked_default_and_restores_branch(
 def test_context_is_independent_per_repository(tmp_path: Path, git_repo) -> None:
     app_source = git_repo("context-two-app")
     api_source = git_repo("context-two-api")
-    workspace = create_two_repo_workspace(tmp_path, app_source.path, api_source.path, "two-repos")
+    workspace = create_two_repo_workspace(tmp_path, app_source, api_source, "two-repos")
     app_worktree = workspace / "repos" / "app"
     api_worktree = workspace / "repos" / "api"
 
@@ -210,7 +212,7 @@ def test_dirty_claimed_context_preserves_changes_and_unrelated_newer_stash(
     tmp_path: Path, git_repo
 ) -> None:
     source = git_repo("context-dirty-claimed")
-    workspace = create_workspace(tmp_path, source.path, "dirty", default_ref="main")
+    workspace = create_workspace(tmp_path, source, "dirty", default_ref="main")
     worktree = workspace / "repos" / "app"
     assert run_ws(worktree, "claim", "app", "--target", "feature/dirty").returncode == 0
     (worktree / "tracked.txt").write_text("base\n", encoding="utf-8")
@@ -257,9 +259,11 @@ def test_detached_context_restores_detached_head_and_explicit_ref(tmp_path: Path
     config = tmp_path / "config" / "ws.toml"
     config.parent.mkdir()
     write_config(config, source.path)
+    initialize_sources(config.parent)
+    adopt_source(source, config.parent, "app")
     result = run_ws(config.parent, "create", "detached", "--config", str(config))
     assert result.returncode == 0, result.stderr
-    workspace = tmp_path / "workspaces" / "detached"
+    workspace = config.parent / "workspaces" / "detached"
     worktree = workspace / "repos" / "app"
     original = git_output(worktree, "rev-parse", "HEAD")
     target = git_output(source.path, "rev-parse", "feature/inspect")
@@ -331,7 +335,7 @@ def test_context_checkout_failure_persists_target_commit_and_no_recovery(
     tmp_path: Path, git_repo, monkeypatch
 ) -> None:
     source = git_repo("failure-checkout")
-    workspace = create_workspace(tmp_path, source.path, "failure-checkout")
+    workspace = create_workspace(tmp_path, source, "failure-checkout")
     worktree = workspace / "repos" / "app"
     assert run_ws(worktree, "claim", "app", "--target", "feature/failure-checkout").returncode == 0
     target_head = source.commit("context target", content="context target\n")
@@ -361,7 +365,7 @@ def test_context_return_checkout_failure_persists_return_head_without_recovery(
     tmp_path: Path, git_repo, monkeypatch
 ) -> None:
     source = git_repo("failure-return-checkout")
-    workspace = create_workspace(tmp_path, source.path, "failure-return-checkout")
+    workspace = create_workspace(tmp_path, source, "failure-return-checkout")
     worktree = workspace / "repos" / "app"
     assert run_ws(worktree, "claim", "app", "--target", "feature/failure-return").returncode == 0
     saved_head = git_output(worktree, "rev-parse", "HEAD")
@@ -483,7 +487,7 @@ def test_context_blocks_nested_context_claim_and_dirty_temporary_restore(
     tmp_path: Path, git_repo
 ) -> None:
     source = git_repo("context-guards")
-    workspace = create_workspace(tmp_path, source.path, "guards")
+    workspace = create_workspace(tmp_path, source, "guards")
     worktree = workspace / "repos" / "app"
     assert run_ws(worktree, "context", "app", "HEAD").returncode == 0
 
@@ -506,7 +510,7 @@ def test_restore_refuses_changed_claimed_return_branch(
     tmp_path: Path, git_repo, return_branch_change: str
 ) -> None:
     source = git_repo(f"context-return-{return_branch_change}")
-    workspace = create_workspace(tmp_path, source.path, "return-check")
+    workspace = create_workspace(tmp_path, source, "return-check")
     worktree = workspace / "repos" / "app"
     assert run_ws(worktree, "claim", "app", "--target", "feature/return").returncode == 0
     saved_head = git_output(worktree, "rev-parse", "HEAD")
@@ -547,7 +551,7 @@ def test_conflicted_restore_requires_finalize_and_retains_private_snapshot(
     alternate_head = git_output(alternate_worktree, "rev-parse", "HEAD")
     source.run("worktree", "remove", str(alternate_worktree))
     source.run("branch", "other", alternate_head)
-    workspace = create_workspace(tmp_path, source.path, "conflict")
+    workspace = create_workspace(tmp_path, source, "conflict")
     worktree = workspace / "repos" / "app"
     assert run_ws(worktree, "claim", "app", "--target", "feature/conflict").returncode == 0
     (worktree / "README.md").write_text("saved change\n", encoding="utf-8")
@@ -613,7 +617,7 @@ def test_restore_failed_requires_clean_baseline_then_retries_pinned_snapshot(
     tmp_path: Path, git_repo, monkeypatch
 ) -> None:
     source = git_repo("context-retry")
-    workspace = create_workspace(tmp_path, source.path, "retry")
+    workspace = create_workspace(tmp_path, source, "retry")
     worktree = workspace / "repos" / "app"
     assert run_ws(worktree, "claim", "app", "--target", "feature/retry").returncode == 0
     (worktree / "README.md").write_text("saved retry\n", encoding="utf-8")
@@ -654,7 +658,7 @@ def test_interrupted_context_transition_blocks_mutation(
     tmp_path: Path, git_repo, phase: str
 ) -> None:
     source = git_repo(f"context-interrupted-{phase}")
-    workspace = create_workspace(tmp_path, source.path, f"interrupted-{phase}")
+    workspace = create_workspace(tmp_path, source, f"interrupted-{phase}")
     worktree = workspace / "repos" / "app"
     assert run_ws(worktree, "context", "app", "HEAD").returncode == 0
 
