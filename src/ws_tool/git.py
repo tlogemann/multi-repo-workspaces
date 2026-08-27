@@ -93,6 +93,10 @@ def run_git(
     return result
 
 
+def clone_repository(url: str, destination: Path) -> GitResult:
+    return run_git(["clone", url, destination], cwd=destination.parent)
+
+
 def remote_symbolic_heads(source: Path) -> Sequence[RemoteSymbolicHead]:
     """Return remote symbolic HEADs and the commits to which they resolve."""
 

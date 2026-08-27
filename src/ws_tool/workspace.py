@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 from .config import load_config, parse_source_overrides
 from .errors import ConfigError, GitWorktreeError, SerializationError, WsError
 from .git import (
+    clone_repository,
     create_private_ref,
     delete_private_ref,
     list_worktrees,
@@ -83,6 +85,22 @@ class _CreationPlan:
     base_ref: str
     base_commit: str
     default_selector: str | None
+
+
+def init_workspace(*, cwd: Path | None = None) -> Path:
+    root = (cwd or Path.cwd()).resolve()
+    project = load_config(root / "ws.toml")
+    clone_root = root / "repos"
+    if clone_root.exists() or clone_root.is_symlink():
+        raise WsError(f"source clone root already exists: {clone_root}")
+    clone_root.mkdir()
+    try:
+        for repo in project.repos.values():
+            clone_repository(repo.url, repo.source_path)
+    except BaseException:
+        shutil.rmtree(clone_root)
+        raise
+    return clone_root
 
 
 def create_workspace(

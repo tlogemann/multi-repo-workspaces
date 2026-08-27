@@ -11,6 +11,7 @@ from .workspace import (
     create_workspace,
     enter_context,
     finalize_restore,
+    init_workspace,
     remove_workspace,
     render_status_human,
     restore_context,
@@ -22,9 +23,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ws",
         description="Manage isolated multi-repository Git workspaces.",
-        epilog="Phase 2A syntax: ws create <workspace> [--config PATH]",
+        epilog="Phase 2A syntax: ws init; ws create <workspace> [--config PATH]",
     )
     commands = parser.add_subparsers(dest="command")
+
+    commands.add_parser("init", help="clone configured source repositories")
 
     create = commands.add_parser("create", help="create a detached workspace")
     create.add_argument("workspace")
@@ -64,6 +67,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command is None:
             parser.print_help()
+            return 0
+        if args.command == "init":
+            clone_root = init_workspace()
+            print(f"Initialized source repositories in {clone_root}")
             return 0
         if args.command == "create":
             paths = create_workspace(
