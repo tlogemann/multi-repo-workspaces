@@ -36,7 +36,7 @@ def git_output(cwd: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def write_config(path: Path, workspace_root: Path, source: Path) -> Path:
+def write_config(path: Path, source: Path) -> Path:
     path.write_text(repo_table("app", prepare_remote("app", source)), encoding="utf-8")
     return path
 
@@ -45,7 +45,7 @@ def create_workspace(tmp_path: Path, source, name: str) -> tuple[Path, Path]:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     source_path = source.path if hasattr(source, "path") else source
-    config = write_config(config_dir / "ws.toml", config_dir / "workspaces", source_path)
+    config = write_config(config_dir / "ws.toml", source_path)
     initialize_sources(config_dir)
     if hasattr(source, "path"):
         adopt_source(source, config_dir, "app")

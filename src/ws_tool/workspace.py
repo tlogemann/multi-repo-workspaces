@@ -94,34 +94,55 @@ def init_workspace(*, cwd: Path | None = None) -> Path:
     clone_root = root / "repos"
     if clone_root.exists() or clone_root.is_symlink():
         raise WsError(f"source clone root already exists: {clone_root}")
-    publication_lock = root / ".repos.init.lock"
-    try:
-        publication_lock.mkdir()
-    except FileExistsError as exc:
-        raise WsError(f"source initialization lock already exists: {publication_lock}") from exc
-    temporary_root: Path | None = None
     for repo in project.repos.values():
         expected_source = (clone_root / repo.name).resolve(strict=False)
         if repo.source_path.resolve(strict=False) != expected_source:
-            publication_lock.rmdir()
             raise WsError(
                 f"repository {repo.name!r} source path is not under the workspace clone root: "
                 f"{repo.source_path}"
             )
     try:
+        clone_root.mkdir()
+    except FileExistsError as exc:
+        raise WsError(f"source clone root appeared during initialization: {clone_root}") from exc
+
+    marker = clone_root / ".ws-init.lock"
+    marker_owned = False
+    temporary_root: Path | None = None
+    published: list[Path] = []
+    try:
+        try:
+            marker.mkdir()
+            marker_owned = True
+        except FileExistsError as exc:
+            raise WsError(f"source initialization marker already exists: {marker}") from exc
         temporary_root = Path(tempfile.mkdtemp(prefix=".repos.init-", dir=root))
+        assert temporary_root is not None
         for repo in project.repos.values():
             clone_repository(repo.url, temporary_root / repo.name)
-        if clone_root.exists() or clone_root.is_symlink():
-            raise WsError(f"source clone root appeared during initialization: {clone_root}")
-        temporary_root.rename(clone_root)
+        for repo in project.repos.values():
+            staged = temporary_root / repo.name
+            destination = clone_root / repo.name
+            if destination.exists() or destination.is_symlink():
+                raise WsError(f"source clone appeared during initialization: {destination}")
+            staged.rename(destination)
+            published.append(destination)
+        shutil.rmtree(temporary_root)
         temporary_root = None
+        marker.rmdir()
+        marker_owned = False
         return clone_root
+    except BaseException:
+        for destination in reversed(published):
+            if destination.is_dir() and not destination.is_symlink():
+                shutil.rmtree(destination)
+        if marker_owned and marker.exists():
+            marker.rmdir()
+            clone_root.rmdir()
+        raise
     finally:
         if temporary_root is not None and temporary_root.exists():
             shutil.rmtree(temporary_root)
-        if publication_lock.exists():
-            publication_lock.rmdir()
 
 
 def create_workspace(
@@ -132,6 +153,12 @@ def create_workspace(
 ) -> WorkspacePaths:
     validate_logical_name(workspace_name, kind="workspace")
     project = load_config(Path("ws.toml") if config_path is None else config_path)
+    initialization_marker = project.path.parent / "repos" / ".ws-init.lock"
+    if initialization_marker.exists() or initialization_marker.is_symlink():
+        raise ConfigError(
+            f"source initialization in progress; retry after marker is removed: "
+            f"{initialization_marker}"
+        )
     for name, repo in project.repos.items():
         if repository_kind(repo.source_path) is None:
             raise ConfigError(

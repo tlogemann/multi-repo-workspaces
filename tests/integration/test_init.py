@@ -117,10 +117,12 @@ def test_create_cannot_observe_partially_cloned_sources_during_init(
     thread.start()
     assert entered_clone.wait(timeout=10)
 
-    with pytest.raises(ConfigError, match="not initialized"):
+    with pytest.raises(ConfigError, match="initialization in progress"):
         workspace_module.create_workspace("feature", config_path=config.path)
     assert not (tmp_path / "workspaces" / "feature").exists()
-    assert not (tmp_path / "repos").exists()
+    assert (tmp_path / "repos" / ".ws-init.lock").is_dir()
+    assert not (tmp_path / "repos" / "api").exists()
+    assert not (tmp_path / "repos" / "web").exists()
 
     continue_clone.set()
     thread.join(timeout=10)
@@ -128,6 +130,7 @@ def test_create_cannot_observe_partially_cloned_sources_during_init(
     assert init_error == []
     assert (tmp_path / "repos" / "api").is_dir()
     assert (tmp_path / "repos" / "web").is_dir()
+    assert not (tmp_path / "repos" / ".ws-init.lock").exists()
 
 
 def test_init_rejects_symlinked_config_before_external_mutation(

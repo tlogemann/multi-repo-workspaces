@@ -44,7 +44,7 @@ def git_output(cwd: Path, *args: str, check: bool = True) -> str:
     return git(cwd, *args, check=check).stdout.strip()
 
 
-def write_config(path: Path, workspace_root: Path, sources: dict[str, Path]) -> Path:
+def write_config(path: Path, sources: dict[str, Path]) -> Path:
     repos = "\n".join(
         repo_table(name, prepare_remote(name, source)) for name, source in sources.items()
     )
@@ -56,7 +56,7 @@ def create_workspace(tmp_path: Path, source, name: str) -> tuple[Path, Path]:
     config_dir = tmp_path / f"config-{name}"
     config_dir.mkdir()
     source_path = source.path if hasattr(source, "path") else source
-    config = write_config(config_dir / "ws.toml", config_dir / "workspaces", {"app": source_path})
+    config = write_config(config_dir / "ws.toml", {"app": source_path})
     initialize_sources(config_dir)
     if hasattr(source, "path"):
         adopt_source(source, config_dir, "app")
@@ -232,7 +232,7 @@ def test_empty_terminal_retry_retains_lifecycle_lock_on_final_fsync_failure(
     source = git_repo("empty-terminal-fsync")
     config_dir = tmp_path / "config-empty-terminal-fsync"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", tmp_path / "workspaces", {"app": source.path})
+    config = write_config(config_dir / "ws.toml", {"app": source.path})
     tombstone = config_dir / "workspaces" / ".sample.removing"
     tombstone.mkdir(parents=True)
     workspace_root = tombstone.parent
@@ -486,7 +486,6 @@ def test_remove_partial_later_failure_persists_progress_and_retries_only_remaini
     config_dir.mkdir()
     config = write_config(
         config_dir / "ws.toml",
-        tmp_path / "workspaces",
         {"app": app.path, "library": library.path},
     )
     initialize_sources(config_dir)
@@ -668,7 +667,7 @@ def test_remove_config_disagreement_inside_workspace_refuses_before_mutation(
     other_config_dir = tmp_path / "other-config"
     other_config_dir.mkdir()
     other_config = write_config(
-        other_config_dir / "ws.toml", tmp_path / "other-workspaces", {"app": source.path}
+        other_config_dir / "ws.toml", {"app": source.path}
     )
 
     result = run_ws(workspace, "remove", "disagreement", "--config", str(other_config))

@@ -234,13 +234,14 @@ the separately recorded default selector needed by workspace-local
 ### 4b. Source availability
 
 `ws init` must be run from the project root before `ws create`. It validates
-the `[[repos]]` entries, clones each configured URL into an owned temporary
-sibling of `repos/`, and atomically renames that completed root to `repos/`
-only after all clones succeed. A pre-existing `repos/` is rejected before any
-clone starts. If a clone fails, initialization removes only its temporary clone
-root, preserving `ws.toml` and unrelated project files. Consequently,
-`ws create` observes either no source root or the complete published source
-root, never partial clones.
+the `[[repos]]` entries, reserves `repos/` with an owned initialization marker,
+and clones each configured URL into an owned temporary sibling. It stages those
+completed clones under the reserved root and removes the marker only after all
+clones succeed. A pre-existing `repos/` is rejected before any clone starts.
+If a clone fails, initialization removes only its temporary clone root and its
+owned empty reservation, preserving `ws.toml` and unrelated project files.
+`ws create` refuses the marker and therefore observes either no source root or
+the complete published source root, never partial clones.
 
 `ws create` requires every configured source clone at
 `repos/<repository>` to be an initialized Git repository. Missing or invalid
@@ -1363,7 +1364,8 @@ transaction must not silently reuse an existing target.
 
 # 23. Source repository safety
 
-The existing repositories configured by `path` are source repositories.
+The initialized repositories under the project's `repos/` root are source
+repositories.
 
 Operations must not unexpectedly change their working tree state.
 
@@ -2053,7 +2055,6 @@ durable.
 Add focused unit tests where useful for:
 
 * configuration parsing;
-* relative path resolution;
 * automatic target branch generation;
 * special `source=default` parsing;
 * lock serialization;
@@ -2477,7 +2478,6 @@ Do not:
 * delete a removal tombstone before durable `removal_complete` and both
   absence checks;
 * rename a workspace directory while any registered worktree remains;
-* treat a bare source as exempt from workspace-root containment checks;
 * create branches for context-only repositories;
 * treat `context` as equivalent to `claim`;
 * allow nested context switching in this first version;

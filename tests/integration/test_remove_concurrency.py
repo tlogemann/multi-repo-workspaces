@@ -35,7 +35,7 @@ def git_output(cwd: Path, *args: str) -> str:
     return result.stdout
 
 
-def write_config(path: Path, workspace_root: Path, source: Path) -> Path:
+def write_config(path: Path, source: Path) -> Path:
     path.write_text(repo_table("app", prepare_remote("app", source)), encoding="utf-8")
     return path
 
@@ -44,7 +44,7 @@ def create_workspace(tmp_path: Path, source) -> tuple[Path, Path]:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     source_path = source.path if hasattr(source, "path") else source
-    config = write_config(config_dir / "ws.toml", config_dir / "workspaces", source_path)
+    config = write_config(config_dir / "ws.toml", source_path)
     initialize_sources(config_dir)
     if hasattr(source, "path"):
         adopt_source(source, config_dir, "app")
@@ -87,7 +87,7 @@ def test_second_create_fails_while_first_holds_lifecycle_lock(
     source = git_repo("create-concurrency")
     config_dir = tmp_path / "config"
     config_dir.mkdir()
-    config = write_config(config_dir / "ws.toml", tmp_path / "workspaces", source.path)
+    config = write_config(config_dir / "ws.toml", source.path)
     initialize_sources(config_dir)
     adopt_source(source, config_dir, "app")
     registrations = git_output(source.path, "worktree", "list", "--porcelain")

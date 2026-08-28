@@ -28,7 +28,7 @@ def run_ws(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def write_config(path: Path, workspace_root: str, repos: str) -> Path:
+def write_config(path: Path, repos: str) -> Path:
     path.write_text(repos, encoding="utf-8")
     return path
 
@@ -44,7 +44,6 @@ def create_config(tmp_path: Path, source, *, default_ref: str | None = None) -> 
     source_path = source.path if hasattr(source, "path") else source
     config = write_config(
         config_dir / "ws.toml",
-        "../workspaces",
         _repo_table("app", prepare_remote("app", source_path), default_ref),
     )
     initialize_sources(config_dir)
