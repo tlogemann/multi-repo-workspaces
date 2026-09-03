@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from test_phase2 import run_ws
 
+import ws_tool.source_initialization as source_initialization_module
 import ws_tool.workspace as workspace_module
 from ws_tool.config import load_config
 from ws_tool.errors import ConfigError
@@ -102,14 +103,14 @@ def test_create_cannot_observe_partially_cloned_sources_during_init(
     config = load_config(tmp_path / "ws.toml")
     entered_clone = threading.Event()
     continue_clone = threading.Event()
-    original_clone = workspace_module.clone_repository
+    original_clone = source_initialization_module.clone_repository
 
     def paused_clone(url: str, destination: Path):
         entered_clone.set()
         assert continue_clone.wait(timeout=10)
         return original_clone(url, destination)
 
-    monkeypatch.setattr(workspace_module, "clone_repository", paused_clone)
+    monkeypatch.setattr(source_initialization_module, "clone_repository", paused_clone)
     init_error: list[BaseException] = []
 
     def run_init() -> None:
