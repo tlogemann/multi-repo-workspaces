@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import threading
 from pathlib import Path
 
@@ -10,6 +11,10 @@ import ws_tool.workspace as workspace_module
 from ws_tool.config import load_config
 from ws_tool.errors import ConfigError
 from ws_tool.git import run_git
+
+
+def test_source_initialization_module_is_available() -> None:
+    assert importlib.util.find_spec("ws_tool.source_initialization") is not None
 
 
 def write_init_config(path: Path, entries: list[tuple[str, str]]) -> Path:
