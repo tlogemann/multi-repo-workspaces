@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ from .models import (
     WorkspaceLockRepo,
     WorkspaceState,
 )
+from .ref_operations import Operation, RefOperationTarget, execute_ref_operation
 from .serialization import (
     deserialize_removal_seal,
     deserialize_workspace_lock,
@@ -1663,6 +1665,105 @@ def finalize_restore(repository_name: str) -> str | None:
     finally:
         if operation_acquired:
             _release_operation_lock(paths.operation_lock)
+
+
+def switch_workspace(target_ref: str, repository_names: Sequence[str] = ()) -> None:
+    _run_workspace_ref_operation("switch", target_ref, repository_names)
+
+
+def merge_workspace(target_ref: str, repository_names: Sequence[str] = ()) -> None:
+    _run_workspace_ref_operation("merge", target_ref, repository_names)
+
+
+def _run_workspace_ref_operation(
+    operation: Operation, target_ref: str, repository_names: Sequence[str]
+) -> None:
+    paths = discover_workspace()
+    acquired = _acquire_operation_lock(paths)
+    try:
+        lock, state = _read_metadata(paths)
+        _validate_discovered_workspace_name(paths, lock)
+        targets = _select_ref_operation_targets(paths, lock, state, repository_names)
+
+        def persist_ref_operation_state() -> None:
+            try:
+                refreshed = _refresh_ref_operation_state(state, targets)
+                write_workspace_state(paths.state, refreshed)
+            except (OSError, SerializationError, ValueError, WsError) as exc:
+                try:
+                    write_workspace_state(paths.state, state)
+                except (OSError, SerializationError, ValueError, WsError) as restore_exc:
+                    raise WsError(
+                        f"workspace-state persistence failed: {exc}; "
+                        f"original-state restoration failed: {restore_exc}"
+                    ) from exc
+                raise WsError(f"workspace-state persistence failed: {exc}") from exc
+
+        execute_ref_operation(
+            operation,
+            target_ref,
+            targets,
+            post_mutation=persist_ref_operation_state,
+        )
+    finally:
+        if acquired:
+            _release_operation_lock(paths.operation_lock)
+
+
+def _select_ref_operation_targets(
+    paths: WorkspacePaths,
+    lock: WorkspaceLock,
+    state: WorkspaceState,
+    repository_names: Sequence[str],
+) -> tuple[RefOperationTarget, ...]:
+    _reject_context_mutation_during_removal(state)
+
+    requested: set[str] = set()
+    for name in repository_names:
+        try:
+            validate_logical_name(name, kind="repository")
+        except ValueError as exc:
+            raise WsError(str(exc)) from exc
+        if name in requested:
+            raise WsError(f"repository {name!r} was supplied more than once")
+        if name not in lock.repos:
+            _locked_repo(lock, name)
+        requested.add(name)
+
+    selected_names = (
+        tuple(lock.repos)
+        if not repository_names
+        else tuple(name for name in lock.repos if name in requested)
+    )
+    targets: list[RefOperationTarget] = []
+    for name in selected_names:
+        locked = _locked_repo(lock, name)
+        saved = state.repos[name]
+        if saved.context is not None:
+            raise WsError(f"repository {name!r} has an active context; restore it first")
+        worktree = paths.workspace / "repos" / name
+        validate_worktree_registration(locked.source_path, worktree)
+        targets.append(RefOperationTarget(name, worktree))
+    return tuple(targets)
+
+
+def _refresh_ref_operation_state(
+    state: WorkspaceState, targets: Sequence[RefOperationTarget]
+) -> WorkspaceState:
+    refreshed = dict(state.repos)
+    for target in targets:
+        live = _read_live_repo(target.worktree)
+        saved = state.repos[target.name]
+        refreshed[target.name] = replace(
+            saved,
+            mode=live["mode"],
+            head=live["head"],
+            branch=live["branch"],
+            detached=live["detached"],
+            dirty=live["dirty"],
+            context=None,
+        )
+    return replace(state, repos=refreshed)
 
 
 def _acquire_operation_lock(paths: WorkspacePaths) -> bool:

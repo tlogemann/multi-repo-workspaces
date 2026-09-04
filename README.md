@@ -111,6 +111,19 @@ ws claim app \
     --target feature/new-api
 ```
 
+### Batch ref operations
+
+```bash
+ws switch release
+ws switch release api
+ws merge origin/main
+ws merge origin/main api web
+```
+
+`switch` checks out the resolved ref commit detached. `merge` merges the resolved ref commit into each selected repository's attached branch. Omitting repository names selects every configured repository; supplying names selects only those definitions in workspace lock-file order.
+
+All selected repositories complete preflight before any Git mutation. Dirty, conflicted, in-progress, context, removal, invalid-worktree, missing-ref, duplicate-name, and detached-merge targets are rejected. A caught in-process failure rolls back started repositories; interruption or process termination may require manual repair.
+
 ### Temporary context
 
 Given:

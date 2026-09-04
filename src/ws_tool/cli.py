@@ -12,10 +12,12 @@ from .workspace import (
     enter_context,
     finalize_restore,
     init_workspace,
+    merge_workspace,
     remove_workspace,
     render_status_human,
     restore_context,
     status_workspace,
+    switch_workspace,
 )
 
 
@@ -23,7 +25,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ws",
         description="Manage isolated multi-repository Git workspaces.",
-        epilog="Phase 2A syntax: ws init; ws create <workspace> [--config PATH]",
+        epilog=(
+            "Phase 2A syntax: ws init; ws create <workspace> [--config PATH]. "
+            "Batch ref syntax: ws switch <ref> [repo ...]; ws merge <ref> [repo ...]"
+        ),
     )
     commands = parser.add_subparsers(dest="command")
 
@@ -52,6 +57,14 @@ def build_parser() -> argparse.ArgumentParser:
     remove = commands.add_parser("remove", help="remove a workspace")
     remove.add_argument("workspace")
     remove.add_argument("--config", type=str)
+
+    switch = commands.add_parser("switch", help="switch repositories to a ref")
+    switch.add_argument("ref")
+    switch.add_argument("repos", nargs="*")
+
+    merge = commands.add_parser("merge", help="merge a ref into repositories")
+    merge.add_argument("ref")
+    merge.add_argument("repos", nargs="*")
     return parser
 
 
@@ -105,6 +118,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "remove":
             remove_workspace(args.workspace, config_path=args.config)
             print(f"Removed workspace {args.workspace}")
+            return 0
+        if args.command == "switch":
+            switch_workspace(args.ref, args.repos)
+            print(f"Switched target repositories to {args.ref}")
+            return 0
+        if args.command == "merge":
+            merge_workspace(args.ref, args.repos)
+            print(f"Merged {args.ref} into target repositories")
             return 0
         print(f"ws {args.command} is not implemented in Phase 2A", file=sys.stderr)
         return 2
